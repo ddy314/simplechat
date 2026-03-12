@@ -1,0 +1,24 @@
+{
+  "name": "@simplechat/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run",
+    "check": "tsc --project tsconfig.json",
+    "dev": "wrangler dev --config wrangler.jsonc",
+    "format": "prettier --check \"src/**/*.ts\""
+  },
+  "dependencies": {
+    "@simplechat/protocol": "*",
+    "hono": "^4.7.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260301.0",
+    "@types/node": "^24.3.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.9.2",
+    "wrangler": "^4.7.1"
+  }
+}
+
