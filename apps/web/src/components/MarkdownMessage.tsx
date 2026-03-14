@@ -10,25 +10,51 @@ export function MarkdownMessage({
   markdown: string;
   outgoing: boolean;
 }) {
+  const bubbleColor = outgoing ? "#95ec69" : "#ffffff";
+  const bubbleBorderColor = outgoing ? "rgba(67, 145, 44, 0.22)" : "rgba(24, 45, 41, 0.1)";
+  const bubbleShadow = outgoing
+    ? "0 10px 22px rgba(83, 150, 59, 0.14)"
+    : "0 10px 22px rgba(22, 33, 30, 0.08)";
+
   return (
     <Paper
       elevation={0}
       sx={{
-        display: "inline-block",
+        position: "relative",
+        display: "block",
         width: "fit-content",
-        maxWidth: "min(32rem, calc(100vw - 7rem))",
+        maxWidth: "min(100%, 42rem)",
         px: 2,
-        py: 1.1,
-        borderRadius: outgoing ? "20px 20px 8px 20px" : "20px 20px 20px 8px",
-        bgcolor: outgoing ? "#bfe2ff" : "rgba(255,255,255,0.92)",
+        py: 1.25,
+        borderRadius: outgoing ? "18px 6px 18px 18px" : "6px 18px 18px 18px",
+        bgcolor: bubbleColor,
         color: "text.primary",
         border: "1px solid",
-        borderColor: outgoing ? "rgba(120, 175, 220, 0.42)" : "divider",
-        boxShadow: outgoing
-          ? "0 8px 18px rgba(74, 144, 226, 0.12)"
-          : "0 8px 20px rgba(22, 33, 30, 0.06)",
-        overflowWrap: "anywhere",
+        borderColor: bubbleBorderColor,
+        boxShadow: bubbleShadow,
+        overflow: "visible",
+        overflowWrap: "break-word",
+        wordBreak: "break-word",
         lineHeight: 1.5,
+        "&::after": {
+          content: '""',
+          position: "absolute",
+          bottom: "14px",
+          width: "12px",
+          height: "12px",
+          backgroundColor: bubbleColor,
+          borderBottom: `1px solid ${bubbleBorderColor}`,
+          transform: "rotate(45deg)",
+          ...(outgoing
+            ? {
+                right: "-6px",
+                borderRight: `1px solid ${bubbleBorderColor}`
+              }
+            : {
+                left: "-6px",
+                borderLeft: `1px solid ${bubbleBorderColor}`
+              })
+        },
         "& > *:first-of-type": {
           marginTop: 0
         },
@@ -72,7 +98,9 @@ export function MarkdownMessage({
           color: "text.secondary"
         },
         "& a": {
-          color: "inherit"
+          color: outgoing ? "#165a19" : "#0a67c2",
+          overflowWrap: "anywhere",
+          wordBreak: "break-all"
         }
       }}
     >
