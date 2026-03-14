@@ -567,41 +567,45 @@ export default function App() {
           <Divider />
 
           <Stack className="composer-panel" spacing={1.5}>
-            <TextField
-              minRows={6}
-              multiline
-              value={composer}
-              onChange={(event) => setComposer(event.target.value)}
-              onKeyDown={handleComposerKeyDown}
-              placeholder="Message"
-            />
-            <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-              {TTL_PRESETS.map((preset) => (
-                <Chip
-                  key={preset.value}
-                  label={preset.label}
-                  clickable
-                  color={selectedTtl === preset.value ? "primary" : "default"}
-                  onClick={() => setSelectedTtl(preset.value)}
-                />
-              ))}
-              <Stack direction="row" alignItems="center" spacing={1}>
-                <Typography variant="body2">Burn after read</Typography>
-                <Switch checked={burnAfterRead} onChange={(event) => setBurnAfterRead(event.target.checked)} />
-              </Stack>
-            </Stack>
-            <Stack direction="row" justifyContent="space-between" alignItems="center">
-              <Typography color="text.secondary" variant="body2">
-                {burnAfterRead ? "Burn after read on" : `Auto delete ${Math.round(selectedTtl / 60)}m`}
-              </Typography>
+            <Stack direction="row" spacing={1.5} alignItems="flex-end">
+              <TextField
+                fullWidth
+                multiline
+                maxRows={4}
+                value={composer}
+                onChange={(event) => setComposer(event.target.value)}
+                onKeyDown={handleComposerKeyDown}
+                placeholder="Message"
+              />
               <Button
                 variant="contained"
+                sx={{ minWidth: 96, height: 56 }}
                 endIcon={busy ? <CircularProgress size={16} color="inherit" /> : <AddIcon />}
                 disabled={busy || !activeConversationId || !composer.trim()}
                 onClick={handleSendMessage}
               >
                 Send
               </Button>
+            </Stack>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap">
+              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                {TTL_PRESETS.map((preset) => (
+                  <Chip
+                    key={preset.value}
+                    size="small"
+                    label={preset.label}
+                    clickable
+                    color={selectedTtl === preset.value ? "primary" : "default"}
+                    onClick={() => setSelectedTtl(preset.value)}
+                  />
+                ))}
+              </Stack>
+              <Stack direction="row" alignItems="center" spacing={1}>
+                <Typography color="text.secondary" variant="body2">
+                  {burnAfterRead ? "Burn after read" : `Auto delete ${Math.round(selectedTtl / 60)}m`}
+                </Typography>
+                <Switch checked={burnAfterRead} onChange={(event) => setBurnAfterRead(event.target.checked)} />
+              </Stack>
             </Stack>
           </Stack>
         </Paper>
