@@ -275,6 +275,11 @@ export default function App() {
       <Box className="login-shell">
         <Paper className="login-card" elevation={0}>
           <Stack spacing={3}>
+            {notice && (
+              <Alert severity="error" onClose={() => setNotice(null)}>
+                {notice}
+              </Alert>
+            )}
             <Stack spacing={1}>
               <Chip icon={<LockIcon />} label="E2EE by default" sx={{ alignSelf: "flex-start" }} />
               <Typography variant="h4">SimpleChat</Typography>

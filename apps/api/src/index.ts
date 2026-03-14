@@ -68,7 +68,7 @@ interface MessageIndexRow {
 const SESSION_COOKIE = "simplechat_session";
 const OAUTH_STATE_COOKIE = "simplechat_oauth_state";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
-const PASSWORD_ITERATIONS = 210_000;
+const PASSWORD_ITERATIONS = 120_000;
 const MAX_ENVELOPE_BYTES = 8 * 1024;
 const MAX_ACTIVE_R2_BYTES = 128 * 1024 * 1024;
 const MAX_R2_WRITES_PER_DAY = 5_000;
@@ -203,20 +203,28 @@ app.post("/auth/register", async (c) => {
   const now = new Date().toISOString();
   const saltBytes = crypto.getRandomValues(new Uint8Array(16));
   const passwordHash = await hashPassword(password, saltBytes, PASSWORD_ITERATIONS);
-  await c.env.DB.batch([
-    c.env.DB.prepare(
+  try {
+    await c.env.DB.prepare(
       `
         INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
         VALUES (?1, ?2, ?3, NULL, ?4, ?4)
       `
-    ).bind(userId, email, displayName, now),
-    c.env.DB.prepare(
+    )
+      .bind(userId, email, displayName, now)
+      .run();
+
+    await c.env.DB.prepare(
       `
         INSERT INTO user_credentials (user_id, password_hash, password_salt, password_iterations, created_at, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?5)
       `
-    ).bind(userId, passwordHash, toBase64Url(saltBytes), PASSWORD_ITERATIONS, now)
-  ]);
+    )
+      .bind(userId, passwordHash, toBase64Url(saltBytes), PASSWORD_ITERATIONS, now)
+      .run();
+  } catch (error) {
+    await c.env.DB.prepare("DELETE FROM users WHERE id = ?1").bind(userId).run();
+    throw error;
+  }
 
   await createSession(c, userId);
   return c.json({ ok: true }, 201);
@@ -1279,24 +1287,19 @@ async function hashPassword(
   salt: Uint8Array,
   iterations: number
 ): Promise<string> {
-  const passwordKey = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"]
-  );
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: "PBKDF2",
-      hash: "SHA-256",
-      salt: Uint8Array.from(salt),
-      iterations
-    },
-    passwordKey,
-    256
-  );
-  return toBase64Url(new Uint8Array(bits));
+  const seed = concatBytes(Uint8Array.from(salt), new TextEncoder().encode(password));
+  let digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(seed)));
+
+  for (let index = 1; index < iterations; index += 1) {
+    digest = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        Uint8Array.from(concatBytes(Uint8Array.from(salt), digest))
+      )
+    );
+  }
+
+  return toBase64Url(digest);
 }
 
 function randomToken(): string {
@@ -1322,6 +1325,13 @@ function fromBase64Url(value: string): Uint8Array {
   const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
   const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
   return Uint8Array.from(atob(normalized + padding), (char) => char.charCodeAt(0));
+}
+
+function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+  const merged = new Uint8Array(left.length + right.length);
+  merged.set(left, 0);
+  merged.set(right, left.length);
+  return merged;
 }
 
 export default {
