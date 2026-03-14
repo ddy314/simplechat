@@ -28,7 +28,13 @@ import SendRoundedIcon from "@mui/icons-material/SendRounded";
 import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
 import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
 import WhatshotRoundedIcon from "@mui/icons-material/WhatshotRounded";
-import { TTL_PRESETS, type ConversationSummary, type OAuthProviderConfig } from "@simplechat/protocol";
+import {
+  TTL_PRESETS,
+  type CiphertextEnvelope,
+  type ConversationDetail,
+  type ConversationSummary,
+  type OAuthProviderConfig
+} from "@simplechat/protocol";
 import { MarkdownMessage } from "./components/MarkdownMessage";
 import { api } from "./lib/api";
 import {
@@ -65,6 +71,17 @@ type ConversationMeta = {
   lastMessageAt: string | null;
 };
 
+type MessageClientStatus = "sending" | "sent-local" | "failed";
+
+type ChatMessage = DecryptedMessage & {
+  clientStatus?: MessageClientStatus;
+};
+
+type ConversationCacheEntry = {
+  detail: ConversationDetail;
+  messages: ChatMessage[];
+};
+
 type SidebarSection = "chats" | "people" | "requests";
 
 const SEEN_STORAGE_KEY = "simplechat_seen_map";
@@ -81,13 +98,15 @@ export default function App() {
   const [requests, setRequests] = useState<any[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
-  const [conversationDetail, setConversationDetail] = useState<any | null>(null);
-  const [messages, setMessages] = useState<DecryptedMessage[]>([]);
+  const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [conversationCache, setConversationCache] = useState<Record<string, ConversationCacheEntry>>({});
   const [composer, setComposer] = useState("");
   const [friendEmail, setFriendEmail] = useState("");
   const [selectedTtl, setSelectedTtl] = useState(TTL_PRESETS[1].value);
   const [burnAfterRead, setBurnAfterRead] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authEmail, setAuthEmail] = useState("");
@@ -98,10 +117,12 @@ export default function App() {
   const [sidebarSection, setSidebarSection] = useState<SidebarSection>("chats");
   const [visibleMessageCount, setVisibleMessageCount] = useState(INITIAL_VISIBLE_MESSAGES);
   const [showNewMessageNotice, setShowNewMessageNotice] = useState(false);
+  const [loadingConversationId, setLoadingConversationId] = useState<string | null>(null);
   const readMarksRef = useRef(new Set<string>());
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollOffsetRef = useRef<number | null>(null);
   const shouldStickToBottomRef = useRef(true);
+  const syncRequestRef = useRef(0);
   const previousMessageStateRef = useRef<{ conversationId: string | null; count: number }>({
     conversationId: null,
     count: 0
@@ -126,6 +147,8 @@ export default function App() {
   );
   const hasOlderMessages = displayedMessages.length < messages.length;
   const selectedTtlPreset = TTL_PRESETS.find((preset) => preset.value === selectedTtl) ?? TTL_PRESETS[0];
+  const isConversationLoading =
+    Boolean(activeConversationId) && loadingConversationId === activeConversationId;
 
   useEffect(() => {
     void bootstrap();
@@ -172,6 +195,21 @@ export default function App() {
     setShowNewMessageNotice(false);
     shouldStickToBottomRef.current = true;
   }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      return;
+    }
+
+    const cachedConversation = conversationCache[activeConversationId];
+    if (cachedConversation) {
+      setConversationDetail(cachedConversation.detail);
+      setMessages(cachedConversation.messages);
+    } else {
+      setConversationDetail(null);
+      setMessages([]);
+    }
+  }, [activeConversationId, conversationCache]);
 
   useEffect(() => {
     if (!activeConversationId) {
@@ -237,6 +275,98 @@ export default function App() {
     };
   }, [activeConversationId, currentUser?.id, messages]);
 
+  function sortMessages(items: ChatMessage[]): ChatMessage[] {
+    return [...items].sort(
+      (left, right) =>
+        left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+    );
+  }
+
+  function mergeRemoteMessages(
+    remoteMessages: DecryptedMessage[],
+    existingMessages: ChatMessage[]
+  ): ChatMessage[] {
+    const remoteIds = new Set(remoteMessages.map((message) => message.id));
+    const localMessages = existingMessages.filter(
+      (message) => message.clientStatus && !remoteIds.has(message.id)
+    );
+
+    return sortMessages([
+      ...remoteMessages.map((message) => ({ ...message, clientStatus: undefined })),
+      ...localMessages
+    ]);
+  }
+
+  function setConversationState(
+    conversationId: string,
+    detail: ConversationDetail,
+    nextMessages: ChatMessage[]
+  ) {
+    const sortedMessages = sortMessages(nextMessages);
+
+    setConversationCache((previous) => ({
+      ...previous,
+      [conversationId]: {
+        detail,
+        messages: sortedMessages
+      }
+    }));
+
+    if (activeConversationId === conversationId) {
+      setConversationDetail(detail);
+      setMessages(sortedMessages);
+    }
+  }
+
+  function patchConversationMessages(
+    conversationId: string,
+    updater: (items: ChatMessage[]) => ChatMessage[]
+  ) {
+    setConversationCache((previous) => {
+      const cachedConversation = previous[conversationId];
+      if (!cachedConversation) {
+        return previous;
+      }
+
+      const nextMessages = sortMessages(updater(cachedConversation.messages));
+      if (activeConversationId === conversationId) {
+        setMessages(nextMessages);
+      }
+
+      return {
+        ...previous,
+        [conversationId]: {
+          ...cachedConversation,
+          messages: nextMessages
+        }
+      };
+    });
+  }
+
+  function buildOptimisticEnvelope(input: {
+    messageId: string;
+    conversationId: string;
+    senderDeviceId: string;
+    createdAt: string;
+    expiresAt: string;
+    burnAfterRead: boolean;
+  }): CiphertextEnvelope {
+    return {
+      version: 1,
+      messageId: input.messageId,
+      conversationId: input.conversationId,
+      senderDeviceId: input.senderDeviceId,
+      ephemeralPublicKey: "",
+      payloadIv: "",
+      ciphertext: "",
+      wrappedKeys: [],
+      paddingBucket: 0,
+      burnAfterRead: input.burnAfterRead,
+      expiresAt: input.expiresAt,
+      createdAt: input.createdAt
+    };
+  }
+
   async function bootstrap() {
     try {
       const [providersResponse, sessionResponse] = await Promise.all([
@@ -272,18 +402,20 @@ export default function App() {
       setFriends(friendsResponse.friends);
       setRequests(requestsResponse.requests);
       setConversations(conversationsResponse.conversations);
-      setActiveConversationId((current) => {
-        if (current && conversationsResponse.conversations.some((conversation) => conversation.id === current)) {
-          return current;
-        }
-
-        return isMobile ? null : conversationsResponse.conversations[0]?.id ?? null;
-      });
+      const nextActiveConversationId =
+        activeConversationId &&
+        conversationsResponse.conversations.some((conversation) => conversation.id === activeConversationId)
+          ? activeConversationId
+          : isMobile
+            ? null
+            : conversationsResponse.conversations[0]?.id ?? null;
+      setActiveConversationId(nextActiveConversationId);
       await syncConversationMeta(
         conversationsResponse.conversations,
         identity,
         currentUser?.id ?? null,
-        activeConversationId
+        nextActiveConversationId,
+        ++syncRequestRef.current
       );
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to load encrypted workspace.");
@@ -295,12 +427,25 @@ export default function App() {
       return;
     }
 
+    const requestId = ++syncRequestRef.current;
+    const shouldShowLoader =
+      Boolean(targetConversationId) && !conversationCache[targetConversationId ?? ""];
+
+    if (shouldShowLoader && targetConversationId) {
+      setLoadingConversationId(targetConversationId);
+    }
+
     try {
       const [friendsResponse, requestsResponse, conversationsResponse] = await Promise.all([
         api.getFriends(),
         api.getFriendRequests(),
         api.getConversations()
       ]);
+
+      if (requestId !== syncRequestRef.current) {
+        return;
+      }
+
       setFriends(friendsResponse.friends);
       setRequests(requestsResponse.requests);
       setConversations(conversationsResponse.conversations);
@@ -308,10 +453,17 @@ export default function App() {
         conversationsResponse.conversations,
         device,
         currentUser?.id ?? null,
-        targetConversationId
+        targetConversationId,
+        requestId
       );
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to sync workspace.");
+    } finally {
+      if (shouldShowLoader && targetConversationId && requestId === syncRequestRef.current) {
+        setLoadingConversationId((current) =>
+          current === targetConversationId ? null : current
+        );
+      }
     }
   }
 
@@ -319,46 +471,104 @@ export default function App() {
     items: ConversationSummary[],
     identity: DeviceIdentity,
     userId: string | null,
-    targetConversationId: string | null
+    targetConversationId: string | null,
+    requestId: number
   ) {
     const nextMeta: Record<string, ConversationMeta> = {};
+    const targetConversation = targetConversationId
+      ? items.find((conversation) => conversation.id === targetConversationId) ?? null
+      : null;
 
-    for (const conversation of items) {
-      const detail = await api.getConversation(conversation.id);
+    if (targetConversation) {
+      const detail = await api.getConversation(targetConversation.id);
       const decrypted = await Promise.all(
         detail.messages.map((message: any) => decryptMessage(identity, message))
       );
-      const visible = decrypted.filter(Boolean) as DecryptedMessage[];
+
+      if (requestId !== syncRequestRef.current) {
+        return;
+      }
+
+      const remoteMessages = decrypted.filter(Boolean) as DecryptedMessage[];
+      const existingMessages =
+        conversationCache[targetConversation.id]?.messages ??
+        (activeConversationId === targetConversation.id ? messages : []);
+      const visible = mergeRemoteMessages(remoteMessages, existingMessages);
       const lastMessage = visible.at(-1) ?? null;
-      const lastSeenAt = seenMap[conversation.id];
+      const lastSeenAt = seenMap[targetConversation.id];
       const unreadCount = visible.filter(
         (message) =>
           message.senderUserId !== userId &&
           (!lastSeenAt || new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime())
       ).length;
 
-      nextMeta[conversation.id] = {
+      nextMeta[targetConversation.id] = {
         preview: lastMessage ? toPreview(lastMessage.markdown) : "",
-        unreadCount: conversation.id === targetConversationId ? 0 : unreadCount,
+        unreadCount: 0,
         lastMessageAt: lastMessage?.createdAt ?? null
       };
 
-      if (conversation.id === targetConversationId) {
-        setConversationDetail(detail);
-        setMessages(visible);
-        markConversationSeen(conversation.id, visible);
+      setConversationState(targetConversation.id, detail, visible);
+      markConversationSeen(targetConversation.id, visible);
 
-        for (const message of visible) {
-          if (
-            message.burnAfterRead &&
-            message.senderUserId !== userId &&
-            !readMarksRef.current.has(message.id)
-          ) {
-            readMarksRef.current.add(message.id);
-            void api.markMessageRead(conversation.id, message.id);
-          }
+      for (const message of visible) {
+        if (
+          message.burnAfterRead &&
+          message.senderUserId !== userId &&
+          !readMarksRef.current.has(message.id)
+        ) {
+          readMarksRef.current.add(message.id);
+          void api.markMessageRead(targetConversation.id, message.id);
         }
       }
+
+      setLoadingConversationId((current) =>
+        current === targetConversation.id ? null : current
+      );
+    }
+
+    const remainingConversations = items.filter(
+      (conversation) => conversation.id !== targetConversationId
+    );
+    const remainingResults = await Promise.all(
+      remainingConversations.map(async (conversation) => {
+        const detail = await api.getConversation(conversation.id);
+        const decrypted = await Promise.all(
+          detail.messages.map((message: any) => decryptMessage(identity, message))
+        );
+        const remoteMessages = decrypted.filter(Boolean) as DecryptedMessage[];
+        const visible = mergeRemoteMessages(
+          remoteMessages,
+          conversationCache[conversation.id]?.messages ?? []
+        );
+        const lastMessage = visible.at(-1) ?? null;
+        const lastSeenAt = seenMap[conversation.id];
+        const unreadCount = visible.filter(
+          (message) =>
+            message.senderUserId !== userId &&
+            (!lastSeenAt || new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime())
+        ).length;
+
+        return {
+          conversationId: conversation.id,
+          detail,
+          visible,
+          meta: {
+            preview: lastMessage ? toPreview(lastMessage.markdown) : "",
+            unreadCount,
+            lastMessageAt: lastMessage?.createdAt ?? null
+          }
+        };
+      })
+    );
+
+    if (requestId !== syncRequestRef.current) {
+      return;
+    }
+
+    for (const result of remainingResults) {
+      nextMeta[result.conversationId] = result.meta;
+      setConversationState(result.conversationId, result.detail, result.visible);
     }
 
     setConversationMeta(nextMeta);
@@ -369,52 +579,96 @@ export default function App() {
       return;
     }
 
-    setBusy(true);
+    const conversationId = activeConversationId;
+    const markdown = composer.trim();
+    const messageId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + selectedTtl * 1000).toISOString();
+    const optimisticMessage: ChatMessage = {
+      id: messageId,
+      senderUserId: currentUser?.id ?? "",
+      senderDisplayName: currentUser?.displayName ?? "You",
+      senderAvatarUrl: currentUser?.avatarUrl ?? null,
+      createdAt,
+      expiresAt,
+      burnAfterRead,
+      envelope: buildOptimisticEnvelope({
+        messageId,
+        conversationId,
+        senderDeviceId: device.deviceId,
+        createdAt,
+        expiresAt,
+        burnAfterRead
+      }),
+      markdown,
+      clientStatus: "sending"
+    };
+
+    setComposer("");
+    shouldStickToBottomRef.current = true;
+    setIsSendingMessage(true);
+
+    const currentDetail =
+      conversationCache[conversationId]?.detail ?? conversationDetail;
+    if (currentDetail) {
+      const existingMessages =
+        conversationCache[conversationId]?.messages ??
+        (activeConversationId === conversationId ? messages : []);
+      const nextMessages = sortMessages([
+        ...existingMessages.filter((item) => item.id !== optimisticMessage.id),
+        optimisticMessage
+      ]);
+      setConversationState(conversationId, currentDetail, nextMessages);
+      markConversationSeen(conversationId, nextMessages);
+    }
+
+    setConversationMeta((previous) => ({
+      ...previous,
+      [conversationId]: {
+        preview: toPreview(markdown),
+        unreadCount: 0,
+        lastMessageAt: createdAt
+      }
+    }));
+
     try {
-      const markdown = composer.trim();
       const recipients = conversationDetail.participantDevices.map((item: any) => ({
         deviceId: item.deviceId,
         publicKey: item.publicKey
       }));
       const envelope = await encryptMarkdownMessage({
-        conversationId: activeConversationId,
+        conversationId,
         senderDeviceId: device.deviceId,
         markdown,
         burnAfterRead,
         ttlSeconds: selectedTtl,
-        recipients
+        recipients,
+        messageId,
+        createdAt
       });
-      await api.sendMessage(activeConversationId, envelope);
-      setComposer("");
-      const optimisticMessage: DecryptedMessage = {
-        id: envelope.messageId,
-        senderUserId: currentUser?.id ?? "",
-        senderDisplayName: currentUser?.displayName ?? "You",
-        senderAvatarUrl: currentUser?.avatarUrl ?? null,
-        createdAt: envelope.createdAt,
-        expiresAt: envelope.expiresAt,
-        burnAfterRead,
-        envelope,
-        markdown
-      };
-      setMessages((previous) => {
-        const next = [...previous.filter((item) => item.id !== optimisticMessage.id), optimisticMessage];
-        markConversationSeen(activeConversationId, next);
-        return next;
-      });
-      setConversationMeta((previous) => ({
-        ...previous,
-        [activeConversationId]: {
-          preview: toPreview(markdown),
-          unreadCount: 0,
-          lastMessageAt: envelope.createdAt
-        }
-      }));
-      void syncWorkspace(activeConversationId);
+      await api.sendMessage(conversationId, envelope);
+      patchConversationMessages(conversationId, (previous) =>
+        previous.map((message) =>
+          message.id === messageId
+            ? {
+                ...message,
+                envelope,
+                expiresAt: envelope.expiresAt,
+                clientStatus: "sent-local"
+              }
+            : message
+        )
+      );
+      void syncWorkspace(conversationId);
     } catch (error) {
+      patchConversationMessages(conversationId, (previous) =>
+        previous.map((message) =>
+          message.id === messageId ? { ...message, clientStatus: "failed" } : message
+        )
+      );
       setNotice(error instanceof Error ? error.message : "Failed to send message.");
     } finally {
-      setBusy(false);
+      setIsSendingMessage(false);
     }
   }
 
@@ -424,7 +678,7 @@ export default function App() {
     }
 
     event.preventDefault();
-    if (!busy) {
+    if (!isSendingMessage) {
       void handleSendMessage();
     }
   }
@@ -467,9 +721,12 @@ export default function App() {
   }
 
   function handleSelectConversation(id: string) {
+    if (id === activeConversationId) {
+      setSidebarSection("chats");
+      return;
+    }
+
     setActiveConversationId(id);
-    setConversationDetail(null);
-    setMessages([]);
     setShowNewMessageNotice(false);
     setSidebarSection("chats");
   }
@@ -511,7 +768,7 @@ export default function App() {
     list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
   }
 
-  function markConversationSeen(conversationId: string, visible: DecryptedMessage[]) {
+  function markConversationSeen(conversationId: string, visible: ChatMessage[]) {
     if (!visible.length) {
       return;
     }
@@ -703,6 +960,12 @@ export default function App() {
               className={`message-list ${!displayedMessages.length ? "message-list-empty" : ""}`}
               onScroll={handleMessageListScroll}
             >
+              {isConversationLoading && displayedMessages.length > 0 && (
+                <Box className="message-list-top">
+                  <Chip size="small" label="Refreshing messages..." variant="outlined" />
+                </Box>
+              )}
+
               {hasOlderMessages && (
                 <Box className="message-list-top">
                   <Button variant="text" size="small" onClick={handleLoadOlderMessages}>
@@ -739,6 +1002,12 @@ export default function App() {
                         {message.senderDisplayName} · {formatDateTime(message.createdAt)}
                       </Typography>
                       <MarkdownMessage markdown={message.markdown} outgoing={outgoing} />
+                      {message.clientStatus === "sending" && (
+                        <Chip size="small" label="Sending..." variant="outlined" />
+                      )}
+                      {message.clientStatus === "failed" && (
+                        <Chip size="small" label="Failed to send" color="error" variant="outlined" />
+                      )}
                       {message.burnAfterRead && (
                         <Chip
                           size="small"
@@ -752,7 +1021,17 @@ export default function App() {
                 );
               })}
 
-              {!displayedMessages.length && (
+              {isConversationLoading && !displayedMessages.length && (
+                <Box className="empty-state empty-state-chat">
+                  <CircularProgress size={28} />
+                  <Typography variant="h6">Loading conversation</Typography>
+                  <Typography color="text.secondary">
+                    正在拉取并解密这个会话的消息，请稍等。
+                  </Typography>
+                </Box>
+              )}
+
+              {!isConversationLoading && !displayedMessages.length && (
                 <Box className="empty-state empty-state-chat">
                   <Typography variant="h6">No messages yet</Typography>
                   <Typography color="text.secondary">
@@ -785,9 +1064,9 @@ export default function App() {
                   variant="contained"
                   className="send-button"
                   endIcon={
-                    busy ? <CircularProgress size={16} color="inherit" /> : <SendRoundedIcon />
+                    isSendingMessage ? <CircularProgress size={16} color="inherit" /> : <SendRoundedIcon />
                   }
-                  disabled={busy || !activeConversationId || !composer.trim()}
+                  disabled={isSendingMessage || !activeConversationId || !composer.trim()}
                   onClick={handleSendMessage}
                 >
                   Send

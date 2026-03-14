@@ -48,9 +48,11 @@ export const encryptMarkdownMessage = async (input: {
   burnAfterRead: boolean;
   ttlSeconds: number;
   recipients: Array<{ deviceId: string; publicKey: string }>;
+  messageId?: string;
+  createdAt?: string;
 }): Promise<CiphertextEnvelope> => {
-  const messageId = crypto.randomUUID();
-  const createdAt = new Date().toISOString();
+  const messageId = input.messageId ?? crypto.randomUUID();
+  const createdAt = input.createdAt ?? new Date().toISOString();
   const expiresAt = new Date(Date.now() + input.ttlSeconds * 1000).toISOString();
   const plaintext = buildPaddedPayload(input.markdown);
   const contentKey = crypto.getRandomValues(new Uint8Array(32));
