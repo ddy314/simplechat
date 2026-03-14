@@ -60,11 +60,14 @@ body {
 }
 
 .app-shell {
-  min-height: 100vh;
-  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;
   padding: calc(18px + var(--safe-top)) calc(18px + var(--safe-right)) calc(18px + var(--safe-bottom))
     calc(18px + var(--safe-left));
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .notice-banner {
@@ -75,12 +78,14 @@ body {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr) 288px;
   gap: 18px;
-  min-height: calc(100vh - 36px - var(--safe-top) - var(--safe-bottom));
-  min-height: calc(100dvh - 36px - var(--safe-top) - var(--safe-bottom));
+  flex: 1;
+  min-height: 0;
 }
 
 .sidebar-panel,
+.chat-panel,
 .detail-panel {
+  height: 100%;
   min-height: 0;
   overflow: hidden;
 }
@@ -88,6 +93,7 @@ body {
 .sidebar-content,
 .detail-content {
   height: 100%;
+  min-height: 0;
   overflow: auto;
   padding: 22px;
   box-sizing: border-box;
@@ -122,6 +128,7 @@ body {
 .chat-panel {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
   position: relative;
@@ -142,6 +149,7 @@ body {
 }
 
 .message-list {
+  min-height: 0;
   overflow: auto;
   padding: 20px 22px 12px;
   box-sizing: border-box;
@@ -271,8 +279,8 @@ body {
   .workspace-mobile {
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
-    min-height: 100vh;
-    min-height: 100dvh;
+    height: 100%;
+    min-height: 0;
   }
 
   .sidebar-panel,
@@ -280,8 +288,8 @@ body {
     border-radius: 0 !important;
     border-left: 0;
     border-right: 0;
-    min-height: 100vh;
-    min-height: 100dvh;
+    height: 100%;
+    min-height: 0;
   }
 
   .sidebar-panel {
