@@ -28,6 +28,13 @@ body {
   background: var(--app-bg);
 }
 
+.shell-root {
+  position: relative;
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
 .centered {
   min-height: 100vh;
   min-height: 100dvh;
@@ -68,6 +75,53 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.app-shell-frame {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transform: translateY(28px) scale(0.985);
+  transition:
+    opacity 320ms ease,
+    transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  pointer-events: none;
+}
+
+.app-shell-frame-ready {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+}
+
+.workspace-transition {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  padding: calc(24px + var(--safe-top)) calc(20px + var(--safe-right)) calc(20px + var(--safe-bottom))
+    calc(20px + var(--safe-left));
+  background:
+    radial-gradient(circle at top, rgba(47, 111, 103, 0.18), transparent 40%),
+    rgba(244, 247, 245, 0.78);
+  backdrop-filter: blur(18px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease;
+}
+
+.workspace-transition-visible {
+  opacity: 1;
+}
+
+.workspace-transition-card {
+  width: min(560px, 100%);
+  padding: 28px;
+  border-radius: 30px !important;
+  border: 1px solid rgba(24, 45, 41, 0.1);
+  background: rgba(255, 255, 255, 0.82) !important;
+  box-shadow: 0 24px 56px rgba(24, 45, 41, 0.12);
 }
 
 .notice-banner {
@@ -271,6 +325,10 @@ body {
     padding: 0;
   }
 
+  .app-shell-frame {
+    transform: translateY(18px) scale(0.992);
+  }
+
   .notice-banner {
     margin: 12px;
   }
@@ -328,5 +386,10 @@ body {
 
   .new-message-notice {
     bottom: calc(116px + var(--safe-bottom));
+  }
+
+  .workspace-transition-card {
+    padding: 24px;
+    border-radius: 24px !important;
   }
 }

@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type UIEvent } from "react";
+import {
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type UIEvent
+} from "react";
 import {
   Alert,
   Avatar,
@@ -33,7 +41,10 @@ import {
   type CiphertextEnvelope,
   type ConversationDetail,
   type ConversationSummary,
-  type OAuthProviderConfig
+  type FriendRequestSummary,
+  type FriendSummary,
+  type OAuthProviderConfig,
+  type SessionUser
 } from "@simplechat/protocol";
 import { MarkdownMessage } from "./components/MarkdownMessage";
 import { api } from "./lib/api";
@@ -48,22 +59,9 @@ import {
 type SessionState =
   | { loading: true }
   | { loading: false; user: null }
-  | {
-      loading: false;
-      user: {
-        id: string;
-        email: string;
-        displayName: string;
-        avatarUrl: string | null;
-      };
-    };
+  | { loading: false; user: SessionUser };
 
-type User = {
-  id: string;
-  email: string;
-  displayName: string;
-  avatarUrl: string | null;
-};
+type User = SessionUser;
 
 type ConversationMeta = {
   preview: string;
@@ -83,24 +81,44 @@ type ConversationCacheEntry = {
 };
 
 type SidebarSection = "chats" | "people" | "requests";
+type WorkspaceStatus = "idle" | "hydrating" | "ready";
+
+type SyncWorkspaceOptions = {
+  targetConversationId?: string | null;
+  forceConversation?: boolean;
+  showLoader?: boolean;
+  includeConversation?: boolean;
+};
+
+type WaitForServerStateOptions = {
+  settled: () => boolean;
+  syncOptions?: SyncWorkspaceOptions;
+  timeoutMs?: number;
+  intervalMs?: number;
+};
 
 const SEEN_STORAGE_KEY = "simplechat_seen_map";
 const INITIAL_VISIBLE_MESSAGES = 80;
 const MESSAGE_PAGE_SIZE = 80;
 const AUTO_SCROLL_THRESHOLD = 96;
+const BACKGROUND_SYNC_INTERVAL_MS = 3_000;
+const MUTATION_CONFIRM_TIMEOUT_MS = 8_000;
 
 export default function App() {
   const isMobile = useMediaQuery("(max-width:900px)");
   const [providers, setProviders] = useState<OAuthProviderConfig[]>([]);
   const [session, setSession] = useState<SessionState>({ loading: true });
+  const [workspaceStatus, setWorkspaceStatus] = useState<WorkspaceStatus>("idle");
   const [device, setDevice] = useState<DeviceIdentity | null>(null);
-  const [friends, setFriends] = useState<any[]>([]);
-  const [requests, setRequests] = useState<any[]>([]);
+  const [friends, setFriends] = useState<FriendSummary[]>([]);
+  const [requests, setRequests] = useState<FriendRequestSummary[]>([]);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
   const [conversationDetail, setConversationDetail] = useState<ConversationDetail | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [conversationCache, setConversationCache] = useState<Record<string, ConversationCacheEntry>>({});
+  const [conversationCache, setConversationCache] = useState<
+    Record<string, ConversationCacheEntry>
+  >({});
   const [composer, setComposer] = useState("");
   const [friendEmail, setFriendEmail] = useState("");
   const [selectedTtl, setSelectedTtl] = useState(TTL_PRESETS[1].value);
@@ -129,16 +147,30 @@ export default function App() {
     count: 0
   });
   const currentUser = !session.loading ? session.user : null;
+  const workspaceReady = Boolean(currentUser) && workspaceStatus === "ready";
+  const showWorkspaceTransition = Boolean(currentUser) && workspaceStatus !== "ready";
+
+  const activeConversationIdRef = useLatestRef(activeConversationId);
+  const conversationCacheRef = useLatestRef(conversationCache);
+  const currentUserRef = useLatestRef(currentUser);
+  const deviceRef = useLatestRef(device);
+  const messagesRef = useLatestRef(messages);
+  const requestsRef = useLatestRef(requests);
+  const conversationsRef = useLatestRef(conversations);
+  const seenMapRef = useLatestRef(seenMap);
 
   const activeConversation = useMemo(
     () => conversations.find((item) => item.id === activeConversationId) ?? null,
     [activeConversationId, conversations]
   );
-  const oauthProviders = providers.filter((provider) => provider.id !== "local" && provider.enabled);
+  const oauthProviders = useMemo(
+    () => providers.filter((provider) => provider.id !== "local" && provider.enabled),
+    [providers]
+  );
   const incomingRequests = useMemo(
     () =>
       requests.filter(
-        (request: any) => request.direction === "incoming" && request.status === "pending"
+        (request) => request.direction === "incoming" && request.status === "pending"
       ),
     [requests]
   );
@@ -147,7 +179,8 @@ export default function App() {
     [messages, visibleMessageCount]
   );
   const hasOlderMessages = displayedMessages.length < messages.length;
-  const selectedTtlPreset = TTL_PRESETS.find((preset) => preset.value === selectedTtl) ?? TTL_PRESETS[0];
+  const selectedTtlPreset =
+    TTL_PRESETS.find((preset) => preset.value === selectedTtl) ?? TTL_PRESETS[0];
   const isConversationLoading =
     Boolean(activeConversationId) && loadingConversationId === activeConversationId;
 
@@ -156,55 +189,66 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!session.loading && currentUser) {
-      void hydrateAuthenticatedState();
-    }
-  }, [currentUser, isMobile, session.loading]);
-
-  useEffect(() => {
-    if (!currentUser || !device) {
+    if (session.loading) {
       return;
     }
 
-    lastRefreshAtRef.current = Date.now();
-    void syncWorkspace(activeConversationId);
-  }, [activeConversationId, currentUser, device?.deviceId]);
-
-  useEffect(() => {
-    if (!currentUser || !device) {
+    if (!currentUser) {
+      resetWorkspaceState(false);
       return;
     }
 
-    const refreshIfNeeded = () => {
-      if (document.visibilityState === "hidden") {
-        return;
-      }
+    let cancelled = false;
 
-      const now = Date.now();
-      if (now - lastRefreshAtRef.current < 4_000) {
-        return;
-      }
+    const hydrateWorkspace = async () => {
+      setWorkspaceStatus("hydrating");
 
-      lastRefreshAtRef.current = now;
-      void syncWorkspace(activeConversationId);
+      try {
+        const identity = await ensureDeviceIdentity();
+        if (cancelled) {
+          return;
+        }
+
+        await api.registerDevice({
+          deviceId: identity.deviceId,
+          label: identity.label,
+          publicKey: identity.publicKey
+        });
+        if (cancelled) {
+          return;
+        }
+
+        setDevice(identity);
+        await syncWorkspace(
+          {
+            targetConversationId: activeConversationIdRef.current,
+            forceConversation: true,
+            showLoader: Boolean(activeConversationIdRef.current)
+          },
+          identity
+        );
+        if (cancelled) {
+          return;
+        }
+
+        setWorkspaceStatus("ready");
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+
+        setNotice(error instanceof Error ? error.message : "Failed to load encrypted workspace.");
+        setWorkspaceStatus("ready");
+      }
     };
 
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") {
-        refreshIfNeeded();
-      }
-    };
-
-    window.addEventListener("focus", refreshIfNeeded);
-    window.addEventListener("online", refreshIfNeeded);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    void hydrateWorkspace();
 
     return () => {
-      window.removeEventListener("focus", refreshIfNeeded);
-      window.removeEventListener("online", refreshIfNeeded);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      cancelled = true;
+      syncRequestRef.current += 1;
     };
-  }, [activeConversationId, currentUser, device?.deviceId]);
+  }, [currentUser?.id, session.loading]);
 
   useEffect(() => {
     if (isMobile) {
@@ -255,6 +299,80 @@ export default function App() {
 
     setActiveConversationId(isMobile ? null : conversations[0]?.id ?? null);
   }, [activeConversationId, conversations, isMobile]);
+
+  useEffect(() => {
+    if (!workspaceReady || !device || !activeConversationId) {
+      return;
+    }
+
+    lastRefreshAtRef.current = Date.now();
+    void syncWorkspace(
+      {
+        targetConversationId: activeConversationId,
+        forceConversation: !conversationCacheRef.current[activeConversationId],
+        showLoader: !conversationCacheRef.current[activeConversationId]
+      },
+      device
+    );
+  }, [activeConversationId, device?.deviceId, workspaceReady]);
+
+  const triggerWorkspaceRefresh = useEffectEvent((options: SyncWorkspaceOptions = {}) => {
+    if (!currentUserRef.current) {
+      return;
+    }
+
+    if (document.visibilityState === "hidden" && !options.forceConversation) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!options.forceConversation && now - lastRefreshAtRef.current < 1_200) {
+      return;
+    }
+
+    lastRefreshAtRef.current = now;
+    void syncWorkspace({
+      targetConversationId: options.targetConversationId ?? activeConversationIdRef.current,
+      forceConversation: options.forceConversation,
+      showLoader: options.showLoader,
+      includeConversation: options.includeConversation
+    });
+  });
+
+  useEffect(() => {
+    if (!workspaceReady || !device) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      triggerWorkspaceRefresh({
+        targetConversationId: activeConversationIdRef.current
+      });
+    }, BACKGROUND_SYNC_INTERVAL_MS);
+
+    const refreshNow = () => {
+      triggerWorkspaceRefresh({
+        targetConversationId: activeConversationIdRef.current
+      });
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshNow();
+      }
+    };
+
+    window.addEventListener("focus", refreshNow);
+    window.addEventListener("online", refreshNow);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener("focus", refreshNow);
+      window.removeEventListener("online", refreshNow);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [device?.deviceId, workspaceReady]);
 
   useEffect(() => {
     const list = messageListRef.current;
@@ -345,7 +463,7 @@ export default function App() {
       }
     }));
 
-    if (activeConversationId === conversationId) {
+    if (activeConversationIdRef.current === conversationId) {
       setConversationDetail(detail);
       setMessages(sortedMessages);
     }
@@ -362,7 +480,7 @@ export default function App() {
       }
 
       const nextMessages = sortMessages(updater(cachedConversation.messages));
-      if (activeConversationId === conversationId) {
+      if (activeConversationIdRef.current === conversationId) {
         setMessages(nextMessages);
       }
 
@@ -400,12 +518,47 @@ export default function App() {
     };
   }
 
+  function resetWorkspaceState(clearSeenState: boolean) {
+    syncRequestRef.current += 1;
+    lastRefreshAtRef.current = 0;
+    readMarksRef.current.clear();
+    pendingScrollOffsetRef.current = null;
+    shouldStickToBottomRef.current = true;
+    previousMessageStateRef.current = {
+      conversationId: null,
+      count: 0
+    };
+
+    setWorkspaceStatus("idle");
+    setDevice(null);
+    setFriends([]);
+    setRequests([]);
+    setConversations([]);
+    setActiveConversationId(null);
+    setConversationDetail(null);
+    setMessages([]);
+    setConversationCache({});
+    setConversationMeta({});
+    setComposer("");
+    setFriendEmail("");
+    setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
+    setShowNewMessageNotice(false);
+    setLoadingConversationId(null);
+    setSidebarSection("chats");
+
+    if (clearSeenState) {
+      saveSeenMap({});
+      setSeenMap({});
+    }
+  }
+
   async function bootstrap() {
     try {
       const [providersResponse, sessionResponse] = await Promise.all([
         api.getProviders(),
         api.getSession()
       ]);
+
       setProviders(providersResponse.providers);
       setSession(
         sessionResponse.authenticated && sessionResponse.user
@@ -418,197 +571,223 @@ export default function App() {
     }
   }
 
-  async function hydrateAuthenticatedState() {
-    try {
-      const identity = await ensureDeviceIdentity();
-      await api.registerDevice({
-        deviceId: identity.deviceId,
-        label: identity.label,
-        publicKey: identity.publicKey
-      });
-      setDevice(identity);
-      const [friendsResponse, requestsResponse, conversationsResponse] = await Promise.all([
-        api.getFriends(),
-        api.getFriendRequests(),
-        api.getConversations()
-      ]);
-      setFriends(friendsResponse.friends);
-      setRequests(requestsResponse.requests);
-      setConversations(conversationsResponse.conversations);
-      const nextActiveConversationId =
-        activeConversationId &&
-        conversationsResponse.conversations.some((conversation) => conversation.id === activeConversationId)
-          ? activeConversationId
-          : isMobile
-            ? null
-            : conversationsResponse.conversations[0]?.id ?? null;
-      setActiveConversationId(nextActiveConversationId);
-      await syncConversationMeta(
-        conversationsResponse.conversations,
-        identity,
-        currentUser?.id ?? null,
-        nextActiveConversationId,
-        ++syncRequestRef.current
-      );
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Failed to load encrypted workspace.");
-    }
-  }
-
-  async function syncWorkspace(targetConversationId: string | null) {
-    if (!device) {
+  async function refreshConversationDetail(input: {
+    conversationId: string;
+    identity: DeviceIdentity;
+    userId: string;
+    requestId: number;
+    markSeen: boolean;
+  }) {
+    const detail = await api.getConversation(input.conversationId);
+    if (input.requestId !== syncRequestRef.current) {
       return;
     }
 
-    const requestId = ++syncRequestRef.current;
-    const shouldShowLoader =
-      Boolean(targetConversationId) && !conversationCache[targetConversationId ?? ""];
+    const decrypted = await Promise.all(
+      detail.messages.map((message) => decryptMessage(input.identity, message))
+    );
+    if (input.requestId !== syncRequestRef.current) {
+      return;
+    }
 
-    if (shouldShowLoader && targetConversationId) {
-      setLoadingConversationId(targetConversationId);
+    const remoteMessages = decrypted.filter(
+      (message): message is DecryptedMessage => message !== null
+    );
+    const existingMessages =
+      conversationCacheRef.current[input.conversationId]?.messages ??
+      (activeConversationIdRef.current === input.conversationId ? messagesRef.current : []);
+    const visible = mergeRemoteMessages(remoteMessages, existingMessages);
+    const unreadCount = input.markSeen
+      ? 0
+      : countUnreadMessages(
+          visible,
+          input.userId,
+          seenMapRef.current[input.conversationId]
+        );
+
+    setConversationState(input.conversationId, detail, visible);
+    setConversationMeta((previous) => ({
+      ...previous,
+      [input.conversationId]: {
+        preview:
+          visible.at(-1)?.markdown
+            ? toPreview(visible.at(-1)!.markdown)
+            : previous[input.conversationId]?.preview ??
+              detail.conversation.counterpart?.email ??
+              "Encrypted channel",
+        unreadCount,
+        lastMessageAt:
+          visible.at(-1)?.createdAt ??
+          detail.conversation.lastMessageAt ??
+          previous[input.conversationId]?.lastMessageAt ??
+          null
+      }
+    }));
+
+    if (input.markSeen) {
+      markConversationSeen(input.conversationId, visible);
+    }
+
+    for (const message of visible) {
+      if (
+        message.burnAfterRead &&
+        message.senderUserId !== input.userId &&
+        !readMarksRef.current.has(message.id)
+      ) {
+        readMarksRef.current.add(message.id);
+        void api.markMessageRead(input.conversationId, message.id);
+      }
+    }
+
+    setLoadingConversationId((current) =>
+      current === input.conversationId ? null : current
+    );
+  }
+
+  async function syncWorkspace(
+    options: SyncWorkspaceOptions = {},
+    identityOverride: DeviceIdentity | null = deviceRef.current
+  ) {
+    const user = currentUserRef.current;
+    if (!user) {
+      return;
+    }
+
+    if (options.includeConversation !== false && !identityOverride) {
+      return;
+    }
+
+    const desiredConversationId =
+      options.targetConversationId ?? activeConversationIdRef.current;
+    const requestId = ++syncRequestRef.current;
+    const shouldShowLoader = Boolean(desiredConversationId) && options.showLoader;
+
+    if (shouldShowLoader && desiredConversationId) {
+      setLoadingConversationId(desiredConversationId);
     }
 
     try {
-      const [friendsResponse, requestsResponse, conversationsResponse] = await Promise.all([
-        api.getFriends(),
-        api.getFriendRequests(),
-        api.getConversations()
-      ]);
-
+      const snapshot = await api.getWorkspace();
       if (requestId !== syncRequestRef.current) {
         return;
       }
 
-      setFriends(friendsResponse.friends);
-      setRequests(requestsResponse.requests);
-      setConversations(conversationsResponse.conversations);
-      await syncConversationMeta(
-        conversationsResponse.conversations,
-        device,
-        currentUser?.id ?? null,
-        targetConversationId,
-        requestId
+      const nextActiveConversationId = resolveNextActiveConversationId(
+        desiredConversationId,
+        snapshot.conversations,
+        isMobile
       );
+
+      setFriends(snapshot.friends);
+      setRequests(snapshot.requests);
+      setConversations(snapshot.conversations);
+      setConversationMeta((previous) =>
+        buildConversationMetaMap(
+          snapshot.conversations,
+          conversationCacheRef.current,
+          previous,
+          seenMapRef.current,
+          user.id
+        )
+      );
+      setActiveConversationId(nextActiveConversationId);
+
+      if (
+        options.includeConversation === false ||
+        !nextActiveConversationId ||
+        !identityOverride
+      ) {
+        return;
+      }
+
+      const targetConversation =
+        snapshot.conversations.find((conversation) => conversation.id === nextActiveConversationId) ??
+        null;
+      if (
+        !shouldRefreshConversationDetail(
+          targetConversation,
+          conversationCacheRef.current[nextActiveConversationId],
+          options.forceConversation ?? false
+        )
+      ) {
+        return;
+      }
+
+      await refreshConversationDetail({
+        conversationId: nextActiveConversationId,
+        identity: identityOverride,
+        userId: user.id,
+        requestId,
+        markSeen: nextActiveConversationId === activeConversationIdRef.current
+      });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to sync workspace.");
     } finally {
-      if (shouldShowLoader && targetConversationId && requestId === syncRequestRef.current) {
+      if (shouldShowLoader && desiredConversationId && requestId === syncRequestRef.current) {
         setLoadingConversationId((current) =>
-          current === targetConversationId ? null : current
+          current === desiredConversationId ? null : current
         );
       }
     }
   }
 
-  async function syncConversationMeta(
-    items: ConversationSummary[],
-    identity: DeviceIdentity,
-    userId: string | null,
-    targetConversationId: string | null,
-    requestId: number
-  ) {
-    const nextMeta: Record<string, ConversationMeta> = {};
-    const targetConversation = targetConversationId
-      ? items.find((conversation) => conversation.id === targetConversationId) ?? null
-      : null;
-
-    if (targetConversation) {
-      const detail = await api.getConversation(targetConversation.id);
-      const decrypted = await Promise.all(
-        detail.messages.map((message: any) => decryptMessage(identity, message))
-      );
-
-      if (requestId !== syncRequestRef.current) {
-        return;
+  const waitForServerState = useEffectEvent(
+    async (options: WaitForServerStateOptions): Promise<boolean> => {
+      if (options.settled()) {
+        return true;
       }
 
-      const remoteMessages = decrypted.filter(Boolean) as DecryptedMessage[];
-      const existingMessages =
-        conversationCache[targetConversation.id]?.messages ??
-        (activeConversationId === targetConversation.id ? messages : []);
-      const visible = mergeRemoteMessages(remoteMessages, existingMessages);
-      const lastMessage = visible.at(-1) ?? null;
-      const lastSeenAt = seenMap[targetConversation.id];
-      const unreadCount = visible.filter(
-        (message) =>
-          message.senderUserId !== userId &&
-          (!lastSeenAt || new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime())
-      ).length;
+      const timeoutMs = options.timeoutMs ?? MUTATION_CONFIRM_TIMEOUT_MS;
+      const intervalMs = options.intervalMs ?? 700;
+      const deadline = Date.now() + timeoutMs;
 
-      nextMeta[targetConversation.id] = {
-        preview: lastMessage ? toPreview(lastMessage.markdown) : "",
-        unreadCount: 0,
-        lastMessageAt: lastMessage?.createdAt ?? null
-      };
-
-      setConversationState(targetConversation.id, detail, visible);
-      markConversationSeen(targetConversation.id, visible);
-
-      for (const message of visible) {
-        if (
-          message.burnAfterRead &&
-          message.senderUserId !== userId &&
-          !readMarksRef.current.has(message.id)
-        ) {
-          readMarksRef.current.add(message.id);
-          void api.markMessageRead(targetConversation.id, message.id);
+      while (Date.now() < deadline) {
+        await syncWorkspace(options.syncOptions);
+        if (options.settled()) {
+          return true;
         }
+
+        await sleep(intervalMs);
       }
 
-      setLoadingConversationId((current) =>
-        current === targetConversation.id ? null : current
-      );
+      return options.settled();
     }
+  );
 
-    const remainingConversations = items.filter(
-      (conversation) => conversation.id !== targetConversationId
-    );
-    const remainingResults = await Promise.all(
-      remainingConversations.map(async (conversation) => {
-        const detail = await api.getConversation(conversation.id);
-        const decrypted = await Promise.all(
-          detail.messages.map((message: any) => decryptMessage(identity, message))
-        );
-        const remoteMessages = decrypted.filter(Boolean) as DecryptedMessage[];
-        const visible = mergeRemoteMessages(
-          remoteMessages,
-          conversationCache[conversation.id]?.messages ?? []
-        );
-        const lastMessage = visible.at(-1) ?? null;
-        const lastSeenAt = seenMap[conversation.id];
-        const unreadCount = visible.filter(
-          (message) =>
-            message.senderUserId !== userId &&
-            (!lastSeenAt || new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime())
-        ).length;
-
-        return {
-          conversationId: conversation.id,
-          detail,
-          visible,
-          meta: {
-            preview: lastMessage ? toPreview(lastMessage.markdown) : "",
-            unreadCount,
-            lastMessageAt: lastMessage?.createdAt ?? null
-          }
-        };
-      })
-    );
-
-    if (requestId !== syncRequestRef.current) {
+  function markConversationSeen(conversationId: string, visible: ChatMessage[]) {
+    const latestMessage = visible.at(-1);
+    if (!latestMessage) {
       return;
     }
 
-    for (const result of remainingResults) {
-      nextMeta[result.conversationId] = result.meta;
-      setConversationState(result.conversationId, result.detail, result.visible);
-    }
+    setSeenMap((previous) => {
+      if (previous[conversationId] === latestMessage.createdAt) {
+        return previous;
+      }
 
-    setConversationMeta(nextMeta);
+      const nextSeenMap = {
+        ...previous,
+        [conversationId]: latestMessage.createdAt
+      };
+      saveSeenMap(nextSeenMap);
+      return nextSeenMap;
+    });
+
+    setConversationMeta((previous) => ({
+      ...previous,
+      [conversationId]: {
+        preview:
+          latestMessage.markdown
+            ? toPreview(latestMessage.markdown)
+            : previous[conversationId]?.preview ?? "Encrypted channel",
+        unreadCount: 0,
+        lastMessageAt: latestMessage.createdAt
+      }
+    }));
   }
 
   async function handleSendMessage() {
-    if (!composer.trim() || !activeConversationId || !device || !conversationDetail) {
+    if (!composer.trim() || !activeConversationId || !device || !conversationDetail || !currentUser) {
       return;
     }
 
@@ -619,9 +798,9 @@ export default function App() {
     const expiresAt = new Date(Date.now() + selectedTtl * 1000).toISOString();
     const optimisticMessage: ChatMessage = {
       id: messageId,
-      senderUserId: currentUser?.id ?? "",
-      senderDisplayName: currentUser?.displayName ?? "You",
-      senderAvatarUrl: currentUser?.avatarUrl ?? null,
+      senderUserId: currentUser.id,
+      senderDisplayName: currentUser.displayName,
+      senderAvatarUrl: currentUser.avatarUrl,
       createdAt,
       expiresAt,
       burnAfterRead,
@@ -642,11 +821,11 @@ export default function App() {
     setIsSendingMessage(true);
 
     const currentDetail =
-      conversationCache[conversationId]?.detail ?? conversationDetail;
+      conversationCacheRef.current[conversationId]?.detail ?? conversationDetail;
     if (currentDetail) {
       const existingMessages =
-        conversationCache[conversationId]?.messages ??
-        (activeConversationId === conversationId ? messages : []);
+        conversationCacheRef.current[conversationId]?.messages ??
+        (activeConversationIdRef.current === conversationId ? messagesRef.current : []);
       const nextMessages = sortMessages([
         ...existingMessages.filter((item) => item.id !== optimisticMessage.id),
         optimisticMessage
@@ -665,9 +844,9 @@ export default function App() {
     }));
 
     try {
-      const recipients = conversationDetail.participantDevices.map((item: any) => ({
-        deviceId: item.deviceId,
-        publicKey: item.publicKey
+      const recipients = conversationDetail.participantDevices.map((participant) => ({
+        deviceId: participant.deviceId,
+        publicKey: participant.publicKey
       }));
       const envelope = await encryptMarkdownMessage({
         conversationId,
@@ -679,6 +858,7 @@ export default function App() {
         messageId,
         createdAt
       });
+
       await api.sendMessage(conversationId, envelope);
       patchConversationMessages(conversationId, (previous) =>
         previous.map((message) =>
@@ -692,7 +872,21 @@ export default function App() {
             : message
         )
       );
-      void syncWorkspace(conversationId);
+
+      void waitForServerState({
+        syncOptions: {
+          targetConversationId: conversationId,
+          forceConversation: true
+        },
+        settled: () => {
+          const cachedConversation = conversationCacheRef.current[conversationId];
+          return (
+            cachedConversation?.messages.some(
+              (message) => message.id === messageId && !message.clientStatus
+            ) ?? false
+          );
+        }
+      });
     } catch (error) {
       patchConversationMessages(conversationId, (previous) =>
         previous.map((message) =>
@@ -721,13 +915,24 @@ export default function App() {
       return;
     }
 
+    const normalizedEmail = friendEmail.trim().toLowerCase();
     setBusy(true);
+
     try {
-      await api.createFriendRequest(friendEmail.trim());
+      await api.createFriendRequest(normalizedEmail);
       setFriendEmail("");
       setSidebarSection("requests");
-      const requestsResponse = await api.getFriendRequests();
-      setRequests(requestsResponse.requests);
+      await waitForServerState({
+        syncOptions: {
+          includeConversation: false
+        },
+        settled: () =>
+          requestsRef.current.some(
+            (request) =>
+              request.counterparty.email.toLowerCase() === normalizedEmail &&
+              request.status === "pending"
+          )
+      });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to send friend request.");
     } finally {
@@ -737,9 +942,21 @@ export default function App() {
 
   async function handleAcceptRequest(requestId: string) {
     setBusy(true);
+
     try {
-      await api.acceptFriendRequest(requestId);
-      await hydrateAuthenticatedState();
+      const response = await api.acceptFriendRequest(requestId);
+      setSidebarSection("chats");
+      setActiveConversationId(response.conversationId);
+      await waitForServerState({
+        syncOptions: {
+          targetConversationId: response.conversationId,
+          forceConversation: true
+        },
+        settled: () =>
+          conversationsRef.current.some(
+            (conversation) => conversation.id === response.conversationId
+          )
+      });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to accept request.");
     } finally {
@@ -748,9 +965,18 @@ export default function App() {
   }
 
   async function handleLogout() {
-    await api.logout();
-    window.localStorage.removeItem(SEEN_STORAGE_KEY);
-    window.location.reload();
+    setBusy(true);
+
+    try {
+      await api.logout();
+      window.localStorage.removeItem(SEEN_STORAGE_KEY);
+      resetWorkspaceState(true);
+      setSession({ loading: false, user: null });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Failed to sign out.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   function handleSelectConversation(id: string) {
@@ -787,7 +1013,9 @@ export default function App() {
       pendingScrollOffsetRef.current = list.scrollHeight - list.scrollTop;
     }
 
-    setVisibleMessageCount((previous) => Math.min(previous + MESSAGE_PAGE_SIZE, messages.length));
+    setVisibleMessageCount((previous) =>
+      Math.min(previous + MESSAGE_PAGE_SIZE, messages.length)
+    );
   }
 
   function scrollToLatest() {
@@ -801,23 +1029,9 @@ export default function App() {
     list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
   }
 
-  function markConversationSeen(conversationId: string, visible: ChatMessage[]) {
-    if (!visible.length) {
-      return;
-    }
-
-    setSeenMap((previous) => {
-      const nextSeenMap = {
-        ...previous,
-        [conversationId]: visible[visible.length - 1].createdAt
-      };
-      saveSeenMap(nextSeenMap);
-      return nextSeenMap;
-    });
-  }
-
   async function handleLocalAuth() {
     setBusy(true);
+
     try {
       if (authMode === "register") {
         await api.register({
@@ -849,307 +1063,437 @@ export default function App() {
     );
   }
 
-  if (!session.user) {
-    return (
-      <Box className="login-shell">
-        <Paper className="login-card" elevation={0}>
-          <Stack spacing={2.5}>
-            {notice && (
-              <Alert severity="error" onClose={() => setNotice(null)}>
-                {notice}
-              </Alert>
-            )}
-            <Stack spacing={0.75}>
-              <Typography variant="overline" color="primary.main">
-                Encrypted direct messaging
-              </Typography>
-              <Typography variant="h4">SimpleChat</Typography>
-              <Typography color="text.secondary">
-                一个更像桌面聊天应用的安全会话空间，而不是普通网页表单。
-              </Typography>
-            </Stack>
-            <Stack spacing={1.5}>
-              <Stack direction="row" spacing={1}>
-                <Chip
-                  label="Login"
-                  color={authMode === "login" ? "primary" : "default"}
-                  clickable
-                  onClick={() => setAuthMode("login")}
-                />
-                <Chip
-                  label="Register"
-                  color={authMode === "register" ? "primary" : "default"}
-                  clickable
-                  onClick={() => setAuthMode("register")}
-                />
-              </Stack>
-              {authMode === "register" && (
-                <TextField
-                  label="Display name"
-                  value={authDisplayName}
-                  onChange={(event) => setAuthDisplayName(event.target.value)}
-                />
-              )}
-              <TextField
-                label="Email"
-                type="email"
-                value={authEmail}
-                onChange={(event) => setAuthEmail(event.target.value)}
-              />
-              <TextField
-                label="Password"
-                type="password"
-                value={authPassword}
-                onChange={(event) => setAuthPassword(event.target.value)}
-                helperText={authMode === "register" ? "Minimum 10 characters" : undefined}
-              />
-              <Button variant="contained" size="large" onClick={handleLocalAuth} disabled={busy}>
-                {authMode === "register" ? "Create secure account" : "Sign in"}
-              </Button>
-              {oauthProviders.length > 0 && (
-                <>
-                  <Divider />
-                  {oauthProviders.map((provider) => (
-                    <Button
-                      key={provider.id}
-                      variant="outlined"
-                      size="large"
-                      href={`${import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787"}/auth/oauth/${provider.id}/start`}
-                    >
-                      Continue with {provider.name}
-                    </Button>
-                  ))}
-                </>
-              )}
-            </Stack>
-          </Stack>
-        </Paper>
-      </Box>
-    );
-  }
-
   return (
-    <Box className="app-shell">
-      {notice && (
-        <Alert severity="info" onClose={() => setNotice(null)} className="notice-banner">
-          {notice}
-        </Alert>
+    <Box className="shell-root">
+      {!session.user && (
+        <AuthScreen
+          notice={notice}
+          onDismissNotice={() => setNotice(null)}
+          authMode={authMode}
+          setAuthMode={setAuthMode}
+          authEmail={authEmail}
+          setAuthEmail={setAuthEmail}
+          authPassword={authPassword}
+          setAuthPassword={setAuthPassword}
+          authDisplayName={authDisplayName}
+          setAuthDisplayName={setAuthDisplayName}
+          oauthProviders={oauthProviders}
+          busy={busy}
+          onSubmit={handleLocalAuth}
+        />
       )}
 
-      <Box className={`workspace ${isMobile ? "workspace-mobile" : ""}`}>
-        {(!isMobile || !activeConversationId) && (
-          <Paper className="sidebar-panel" elevation={0}>
-            <SidebarContent
-              currentUser={currentUser}
-              conversations={conversations}
-              conversationMeta={conversationMeta}
-              activeConversationId={activeConversationId}
-              onSelectConversation={handleSelectConversation}
-              friends={friends}
-              requests={incomingRequests}
-              friendEmail={friendEmail}
-              setFriendEmail={setFriendEmail}
-              onAddFriend={handleAddFriend}
-              onAcceptRequest={handleAcceptRequest}
-              onLogout={handleLogout}
-              sidebarSection={sidebarSection}
-              setSidebarSection={setSidebarSection}
-            />
-          </Paper>
-        )}
-
-        {(!isMobile || activeConversationId) && (
-          <Paper className="chat-panel" elevation={0}>
-            <Stack className="chat-header" direction="row" alignItems="center" spacing={2}>
-              {isMobile && (
-                <IconButton onClick={handleBackToList} edge="start" aria-label="Back to chats">
-                  <ArrowBackRoundedIcon />
-                </IconButton>
-              )}
-              <Avatar src={activeConversation?.counterpart?.avatarUrl ?? undefined}>
-                {getInitial(activeConversation?.counterpart?.displayName)}
-              </Avatar>
-              <Box className="chat-header-copy">
-                <Typography variant="h6">
-                  {activeConversation?.counterpart?.displayName ?? "Select a conversation"}
-                </Typography>
-                <Typography color="text.secondary">
-                  {activeConversation?.counterpart?.email ?? "Pick a secure thread to start talking."}
-                </Typography>
-              </Box>
-              {!isMobile && (
-                <Chip
-                  icon={<ShieldRoundedIcon />}
-                  label="End-to-end encrypted"
-                  color="primary"
-                  variant="outlined"
-                  className="chat-status-chip"
-                />
-              )}
-            </Stack>
-
-            <Box
-              ref={messageListRef}
-              className={`message-list ${!displayedMessages.length ? "message-list-empty" : ""}`}
-              onScroll={handleMessageListScroll}
-            >
-              {isConversationLoading && displayedMessages.length > 0 && (
-                <Box className="message-list-top">
-                  <Chip size="small" label="Refreshing messages..." variant="outlined" />
-                </Box>
+      {session.user && (
+        <>
+          <Box className={`app-shell-frame ${workspaceReady ? "app-shell-frame-ready" : ""}`}>
+            <Box className="app-shell">
+              {notice && (
+                <Alert
+                  severity="info"
+                  onClose={() => setNotice(null)}
+                  className="notice-banner"
+                >
+                  {notice}
+                </Alert>
               )}
 
-              {hasOlderMessages && (
-                <Box className="message-list-top">
-                  <Button variant="text" size="small" onClick={handleLoadOlderMessages}>
-                    Load earlier messages
-                  </Button>
-                </Box>
-              )}
+              <Box className={`workspace ${isMobile ? "workspace-mobile" : ""}`}>
+                {(!isMobile || !activeConversationId) && (
+                  <Paper className="sidebar-panel" elevation={0}>
+                    <SidebarContent
+                      currentUser={currentUser}
+                      conversations={conversations}
+                      conversationMeta={conversationMeta}
+                      activeConversationId={activeConversationId}
+                      onSelectConversation={handleSelectConversation}
+                      friends={friends}
+                      requests={incomingRequests}
+                      friendEmail={friendEmail}
+                      setFriendEmail={setFriendEmail}
+                      onAddFriend={handleAddFriend}
+                      onAcceptRequest={handleAcceptRequest}
+                      onLogout={handleLogout}
+                      sidebarSection={sidebarSection}
+                      setSidebarSection={setSidebarSection}
+                    />
+                  </Paper>
+                )}
 
-              {displayedMessages.map((message) => {
-                const outgoing = message.senderUserId === currentUser?.id;
-
-                return (
-                  <Stack
-                    key={message.id}
-                    direction="row"
-                    spacing={1.5}
-                    justifyContent={outgoing ? "flex-end" : "flex-start"}
-                    className={`message-row ${outgoing ? "message-row-outgoing" : "message-row-incoming"}`}
-                  >
-                    {!outgoing && (
-                      <Avatar
-                        src={message.senderAvatarUrl ?? undefined}
-                        className="message-avatar"
-                      >
-                        {getInitial(message.senderDisplayName)}
+                {(!isMobile || activeConversationId) && (
+                  <Paper className="chat-panel" elevation={0}>
+                    <Stack className="chat-header" direction="row" alignItems="center" spacing={2}>
+                      {isMobile && (
+                        <IconButton
+                          onClick={handleBackToList}
+                          edge="start"
+                          aria-label="Back to chats"
+                        >
+                          <ArrowBackRoundedIcon />
+                        </IconButton>
+                      )}
+                      <Avatar src={activeConversation?.counterpart?.avatarUrl ?? undefined}>
+                        {getInitial(activeConversation?.counterpart?.displayName)}
                       </Avatar>
-                    )}
-                    <Stack
-                      spacing={0.75}
-                      alignItems={outgoing ? "flex-end" : "flex-start"}
-                      className="message-content"
-                    >
-                      <Typography variant="caption" color="text.secondary" className="message-meta">
-                        {message.senderDisplayName} · {formatDateTime(message.createdAt)}
-                      </Typography>
-                      <MarkdownMessage markdown={message.markdown} outgoing={outgoing} />
-                      {message.clientStatus === "sending" && (
-                        <Chip size="small" label="Sending..." variant="outlined" />
-                      )}
-                      {message.clientStatus === "failed" && (
-                        <Chip size="small" label="Failed to send" color="error" variant="outlined" />
-                      )}
-                      {message.burnAfterRead && (
+                      <Box className="chat-header-copy">
+                        <Typography variant="h6">
+                          {activeConversation?.counterpart?.displayName ??
+                            "Select a conversation"}
+                        </Typography>
+                        <Typography color="text.secondary">
+                          {activeConversation?.counterpart?.email ??
+                            "Pick a secure thread to start talking."}
+                        </Typography>
+                      </Box>
+                      {!isMobile && (
                         <Chip
-                          size="small"
-                          color="warning"
+                          icon={<ShieldRoundedIcon />}
+                          label="End-to-end encrypted"
+                          color="primary"
                           variant="outlined"
-                          label="Burn after read"
+                          className="chat-status-chip"
                         />
                       )}
                     </Stack>
-                  </Stack>
-                );
-              })}
 
-              {isConversationLoading && !displayedMessages.length && (
-                <Box className="empty-state empty-state-chat">
-                  <CircularProgress size={28} />
-                  <Typography variant="h6">Loading conversation</Typography>
-                  <Typography color="text.secondary">
-                    正在拉取并解密这个会话的消息，请稍等。
-                  </Typography>
-                </Box>
-              )}
+                    <Box
+                      ref={messageListRef}
+                      className={`message-list ${!displayedMessages.length ? "message-list-empty" : ""}`}
+                      onScroll={handleMessageListScroll}
+                    >
+                      {isConversationLoading && displayedMessages.length > 0 && (
+                        <Box className="message-list-top">
+                          <Chip
+                            size="small"
+                            label="Refreshing messages..."
+                            variant="outlined"
+                          />
+                        </Box>
+                      )}
 
-              {!isConversationLoading && !displayedMessages.length && (
-                <Box className="empty-state empty-state-chat">
-                  <Typography variant="h6">No messages yet</Typography>
-                  <Typography color="text.secondary">
-                    发送第一条消息后，这里会保持一个更接近原生聊天应用的时间线视图。
-                  </Typography>
-                </Box>
-              )}
-            </Box>
+                      {hasOlderMessages && (
+                        <Box className="message-list-top">
+                          <Button
+                            variant="text"
+                            size="small"
+                            onClick={handleLoadOlderMessages}
+                          >
+                            Load earlier messages
+                          </Button>
+                        </Box>
+                      )}
 
-            {showNewMessageNotice && (
-              <Box className="new-message-notice">
-                <Button variant="contained" size="small" onClick={scrollToLatest}>
-                  Jump to latest
-                </Button>
-              </Box>
-            )}
+                      {displayedMessages.map((message) => {
+                        const outgoing = message.senderUserId === currentUser?.id;
 
-            <Stack className="composer-panel" spacing={1.5}>
-              <Stack direction="row" spacing={1.5} alignItems="flex-end">
-                <TextField
-                  fullWidth
-                  multiline
-                  maxRows={6}
-                  value={composer}
-                  onChange={(event) => setComposer(event.target.value)}
-                  onKeyDown={handleComposerKeyDown}
-                  placeholder={activeConversationId ? "Write a secure message" : "Select a conversation first"}
-                />
-                <Button
-                  variant="contained"
-                  className="send-button"
-                  endIcon={
-                    isSendingMessage ? <CircularProgress size={16} color="inherit" /> : <SendRoundedIcon />
-                  }
-                  disabled={isSendingMessage || !activeConversationId || !composer.trim()}
-                  onClick={handleSendMessage}
-                >
-                  Send
-                </Button>
-              </Stack>
-              <Stack className="composer-meta" direction="row" justifyContent="space-between" gap={1.5}>
-                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
-                  {TTL_PRESETS.map((preset) => (
-                    <Chip
-                      key={preset.value}
-                      size="small"
-                      label={preset.label}
-                      clickable
-                      color={selectedTtl === preset.value ? "primary" : "default"}
-                      variant={selectedTtl === preset.value ? "filled" : "outlined"}
-                      onClick={() => setSelectedTtl(preset.value)}
+                        return (
+                          <Stack
+                            key={message.id}
+                            direction="row"
+                            spacing={1.5}
+                            justifyContent={outgoing ? "flex-end" : "flex-start"}
+                            className={`message-row ${outgoing ? "message-row-outgoing" : "message-row-incoming"}`}
+                          >
+                            {!outgoing && (
+                              <Avatar
+                                src={message.senderAvatarUrl ?? undefined}
+                                className="message-avatar"
+                              >
+                                {getInitial(message.senderDisplayName)}
+                              </Avatar>
+                            )}
+                            <Stack
+                              spacing={0.75}
+                              alignItems={outgoing ? "flex-end" : "flex-start"}
+                              className="message-content"
+                            >
+                              <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                className="message-meta"
+                              >
+                                {message.senderDisplayName} · {formatDateTime(message.createdAt)}
+                              </Typography>
+                              <MarkdownMessage markdown={message.markdown} outgoing={outgoing} />
+                              {message.clientStatus === "sending" && (
+                                <Chip size="small" label="Sending..." variant="outlined" />
+                              )}
+                              {message.clientStatus === "sent-local" && (
+                                <Chip size="small" label="Syncing..." variant="outlined" />
+                              )}
+                              {message.clientStatus === "failed" && (
+                                <Chip
+                                  size="small"
+                                  label="Failed to send"
+                                  color="error"
+                                  variant="outlined"
+                                />
+                              )}
+                              {message.burnAfterRead && (
+                                <Chip
+                                  size="small"
+                                  color="warning"
+                                  variant="outlined"
+                                  label="Burn after read"
+                                />
+                              )}
+                            </Stack>
+                          </Stack>
+                        );
+                      })}
+
+                      {isConversationLoading && !displayedMessages.length && (
+                        <Box className="empty-state empty-state-chat">
+                          <CircularProgress size={28} />
+                          <Typography variant="h6">Loading conversation</Typography>
+                          <Typography color="text.secondary">
+                            正在拉取并解密这个会话的消息，请稍等。
+                          </Typography>
+                        </Box>
+                      )}
+
+                      {!isConversationLoading && !displayedMessages.length && (
+                        <Box className="empty-state empty-state-chat">
+                          <Typography variant="h6">No messages yet</Typography>
+                          <Typography color="text.secondary">
+                            发送第一条消息后，这里会保持一个更接近原生聊天应用的时间线视图。
+                          </Typography>
+                        </Box>
+                      )}
+                    </Box>
+
+                    {showNewMessageNotice && (
+                      <Box className="new-message-notice">
+                        <Button variant="contained" size="small" onClick={scrollToLatest}>
+                          Jump to latest
+                        </Button>
+                      </Box>
+                    )}
+
+                    <Stack className="composer-panel" spacing={1.5}>
+                      <Stack direction="row" spacing={1.5} alignItems="flex-end">
+                        <TextField
+                          fullWidth
+                          multiline
+                          maxRows={6}
+                          value={composer}
+                          onChange={(event) => setComposer(event.target.value)}
+                          onKeyDown={handleComposerKeyDown}
+                          placeholder={
+                            activeConversationId
+                              ? "Write a secure message"
+                              : "Select a conversation first"
+                          }
+                        />
+                        <Button
+                          variant="contained"
+                          className="send-button"
+                          endIcon={
+                            isSendingMessage ? (
+                              <CircularProgress size={16} color="inherit" />
+                            ) : (
+                              <SendRoundedIcon />
+                            )
+                          }
+                          disabled={isSendingMessage || !activeConversationId || !composer.trim()}
+                          onClick={handleSendMessage}
+                        >
+                          Send
+                        </Button>
+                      </Stack>
+                      <Stack
+                        className="composer-meta"
+                        direction="row"
+                        justifyContent="space-between"
+                        gap={1.5}
+                      >
+                        <Stack
+                          direction="row"
+                          spacing={1}
+                          alignItems="center"
+                          flexWrap="wrap"
+                          useFlexGap
+                        >
+                          {TTL_PRESETS.map((preset) => (
+                            <Chip
+                              key={preset.value}
+                              size="small"
+                              label={preset.label}
+                              clickable
+                              color={selectedTtl === preset.value ? "primary" : "default"}
+                              variant={selectedTtl === preset.value ? "filled" : "outlined"}
+                              onClick={() => setSelectedTtl(preset.value)}
+                            />
+                          ))}
+                        </Stack>
+                        <Stack direction="row" alignItems="center" spacing={1}>
+                          <Typography color="text.secondary" variant="body2">
+                            {burnAfterRead
+                              ? "Burn after read"
+                              : `Auto delete ${selectedTtlPreset.label}`}
+                          </Typography>
+                          <Switch
+                            checked={burnAfterRead}
+                            onChange={(event) => setBurnAfterRead(event.target.checked)}
+                          />
+                        </Stack>
+                      </Stack>
+                    </Stack>
+                  </Paper>
+                )}
+
+                {!isMobile && (
+                  <Paper className="detail-panel" elevation={0}>
+                    <ConversationDetailRail
+                      currentUser={currentUser}
+                      activeConversation={activeConversation}
+                      activeConversationMeta={
+                        activeConversationId ? conversationMeta[activeConversationId] ?? null : null
+                      }
+                      incomingRequestCount={incomingRequests.length}
+                      selectedTtlLabel={selectedTtlPreset.label}
+                      burnAfterRead={burnAfterRead}
+                      messageCount={messages.length}
+                      deviceLabel={device?.label ?? "This device"}
                     />
-                  ))}
-                </Stack>
-                <Stack direction="row" alignItems="center" spacing={1}>
-                  <Typography color="text.secondary" variant="body2">
-                    {burnAfterRead ? "Burn after read" : `Auto delete ${selectedTtlPreset.label}`}
-                  </Typography>
-                  <Switch
-                    checked={burnAfterRead}
-                    onChange={(event) => setBurnAfterRead(event.target.checked)}
-                  />
-                </Stack>
-              </Stack>
-            </Stack>
-          </Paper>
-        )}
+                  </Paper>
+                )}
+              </Box>
+            </Box>
+          </Box>
 
-        {!isMobile && (
-          <Paper className="detail-panel" elevation={0}>
-            <ConversationDetailRail
-              currentUser={currentUser}
-              activeConversation={activeConversation}
-              activeConversationMeta={
-                activeConversationId ? conversationMeta[activeConversationId] ?? null : null
-              }
-              incomingRequestCount={incomingRequests.length}
-              selectedTtlLabel={selectedTtlPreset.label}
-              burnAfterRead={burnAfterRead}
-              messageCount={messages.length}
-              deviceLabel={device?.label ?? "This device"}
+          <WorkspaceTransitionOverlay visible={showWorkspaceTransition} user={currentUser} />
+        </>
+      )}
+    </Box>
+  );
+}
+
+function AuthScreen(props: {
+  notice: string | null;
+  onDismissNotice: () => void;
+  authMode: "login" | "register";
+  setAuthMode: (value: "login" | "register") => void;
+  authEmail: string;
+  setAuthEmail: (value: string) => void;
+  authPassword: string;
+  setAuthPassword: (value: string) => void;
+  authDisplayName: string;
+  setAuthDisplayName: (value: string) => void;
+  oauthProviders: OAuthProviderConfig[];
+  busy: boolean;
+  onSubmit: () => void;
+}) {
+  return (
+    <Box className="login-shell">
+      <Paper className="login-card" elevation={0}>
+        <Stack spacing={2.5}>
+          {props.notice && (
+            <Alert severity="error" onClose={props.onDismissNotice}>
+              {props.notice}
+            </Alert>
+          )}
+          <Stack spacing={0.75}>
+            <Typography variant="overline" color="primary.main">
+              Encrypted direct messaging
+            </Typography>
+            <Typography variant="h4">SimpleChat</Typography>
+            <Typography color="text.secondary">
+              一个更像桌面聊天应用的安全会话空间，而不是普通网页表单。
+            </Typography>
+          </Stack>
+          <Stack spacing={1.5}>
+            <Stack direction="row" spacing={1}>
+              <Chip
+                label="Login"
+                color={props.authMode === "login" ? "primary" : "default"}
+                clickable
+                onClick={() => props.setAuthMode("login")}
+              />
+              <Chip
+                label="Register"
+                color={props.authMode === "register" ? "primary" : "default"}
+                clickable
+                onClick={() => props.setAuthMode("register")}
+              />
+            </Stack>
+            {props.authMode === "register" && (
+              <TextField
+                label="Display name"
+                value={props.authDisplayName}
+                onChange={(event) => props.setAuthDisplayName(event.target.value)}
+              />
+            )}
+            <TextField
+              label="Email"
+              type="email"
+              value={props.authEmail}
+              onChange={(event) => props.setAuthEmail(event.target.value)}
             />
-          </Paper>
-        )}
-      </Box>
+            <TextField
+              label="Password"
+              type="password"
+              value={props.authPassword}
+              onChange={(event) => props.setAuthPassword(event.target.value)}
+              helperText={props.authMode === "register" ? "Minimum 10 characters" : undefined}
+            />
+            <Button
+              variant="contained"
+              size="large"
+              onClick={props.onSubmit}
+              disabled={props.busy}
+            >
+              {props.authMode === "register" ? "Create secure account" : "Sign in"}
+            </Button>
+            {props.oauthProviders.length > 0 && (
+              <>
+                <Divider />
+                {props.oauthProviders.map((provider) => (
+                  <Button
+                    key={provider.id}
+                    variant="outlined"
+                    size="large"
+                    href={`${
+                      import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787"
+                    }/auth/oauth/${provider.id}/start`}
+                  >
+                    Continue with {provider.name}
+                  </Button>
+                ))}
+              </>
+            )}
+          </Stack>
+        </Stack>
+      </Paper>
+    </Box>
+  );
+}
+
+function WorkspaceTransitionOverlay(props: { visible: boolean; user: User | null }) {
+  return (
+    <Box
+      className={`workspace-transition ${
+        props.visible ? "workspace-transition-visible" : ""
+      }`}
+    >
+      <Paper className="workspace-transition-card" elevation={0}>
+        <Stack spacing={2} alignItems="flex-start">
+          <Chip label="Secure workspace" color="primary" variant="outlined" />
+          <Stack spacing={0.75}>
+            <Typography variant="h5">
+              {props.user ? `Welcome back, ${props.user.displayName}` : "Preparing workspace"}
+            </Typography>
+            <Typography color="text.secondary">
+              正在同步联系人、会话和最新消息，进入后会保持统一的等待与刷新节奏。
+            </Typography>
+          </Stack>
+          <Stack direction="row" spacing={1.25} alignItems="center">
+            <CircularProgress size={20} />
+            <Typography variant="body2" color="text.secondary">
+              Loading encrypted threads...
+            </Typography>
+          </Stack>
+        </Stack>
+      </Paper>
     </Box>
   );
 }
@@ -1160,8 +1504,8 @@ function SidebarContent(props: {
   conversationMeta: Record<string, ConversationMeta>;
   activeConversationId: string | null;
   onSelectConversation: (id: string) => void;
-  friends: any[];
-  requests: any[];
+  friends: FriendSummary[];
+  requests: FriendRequestSummary[];
   friendEmail: string;
   setFriendEmail: (value: string) => void;
   onAddFriend: () => void;
@@ -1170,7 +1514,7 @@ function SidebarContent(props: {
   sidebarSection: SidebarSection;
   setSidebarSection: (value: SidebarSection) => void;
 }) {
-  const friendsWithoutConversation = props.friends.filter((friend: any) => !friend.conversationId);
+  const friendsWithoutConversation = props.friends.filter((friend) => !friend.conversationId);
 
   return (
     <Stack className="sidebar-content" spacing={2.5}>
@@ -1246,7 +1590,12 @@ function SidebarContent(props: {
                   <ListItemText
                     disableTypography
                     primary={
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                      <Stack
+                        direction="row"
+                        justifyContent="space-between"
+                        alignItems="center"
+                        gap={1}
+                      >
                         <Typography variant="body2" fontWeight={600} noWrap>
                           {conversation.counterpart?.displayName ?? "Direct conversation"}
                         </Typography>
@@ -1256,7 +1605,12 @@ function SidebarContent(props: {
                       </Stack>
                     }
                     secondary={
-                      <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                      <Stack
+                        direction="row"
+                        justifyContent="space-between"
+                        alignItems="center"
+                        gap={1}
+                      >
                         <Typography variant="body2" color="text.secondary" noWrap>
                           {meta?.preview || conversation.counterpart?.email || "Encrypted channel"}
                         </Typography>
@@ -1304,9 +1658,14 @@ function SidebarContent(props: {
             </Stack>
           </Paper>
           <Stack spacing={1.25}>
-            {props.friends.map((friend: any) => (
+            {props.friends.map((friend) => (
               <Paper key={friend.id} variant="outlined" className="sidebar-card">
-                <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1.5}>
+                <Stack
+                  direction="row"
+                  alignItems="center"
+                  justifyContent="space-between"
+                  gap={1.5}
+                >
                   <Box minWidth={0}>
                     <Typography variant="subtitle2" noWrap>
                       {friend.displayName}
@@ -1316,7 +1675,10 @@ function SidebarContent(props: {
                     </Typography>
                   </Box>
                   {friend.conversationId ? (
-                    <Button size="small" onClick={() => props.onSelectConversation(friend.conversationId)}>
+                    <Button
+                      size="small"
+                      onClick={() => props.onSelectConversation(friend.conversationId!)}
+                    >
                       Open chat
                     </Button>
                   ) : (
@@ -1348,7 +1710,7 @@ function SidebarContent(props: {
             <Typography variant="h6">Pending approvals</Typography>
           </Box>
           <Stack spacing={1.25}>
-            {props.requests.map((request: any) => (
+            {props.requests.map((request) => (
               <Paper key={request.id} variant="outlined" className="sidebar-card">
                 <Stack spacing={1}>
                   <Box>
@@ -1357,7 +1719,11 @@ function SidebarContent(props: {
                       {request.counterparty.email}
                     </Typography>
                   </Box>
-                  <Button size="small" variant="contained" onClick={() => props.onAcceptRequest(request.id)}>
+                  <Button
+                    size="small"
+                    variant="contained"
+                    onClick={() => props.onAcceptRequest(request.id)}
+                  >
                     Accept
                   </Button>
                 </Stack>
@@ -1415,9 +1781,18 @@ function ConversationDetailRail(props: {
             </Stack>
             <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
               <Chip icon={<ShieldRoundedIcon />} label="Encrypted" variant="outlined" />
-              <Chip icon={<TimerOutlinedIcon />} label={`TTL ${props.selectedTtlLabel}`} variant="outlined" />
+              <Chip
+                icon={<TimerOutlinedIcon />}
+                label={`TTL ${props.selectedTtlLabel}`}
+                variant="outlined"
+              />
               {props.burnAfterRead && (
-                <Chip icon={<WhatshotRoundedIcon />} label="Burn after read" color="warning" variant="outlined" />
+                <Chip
+                  icon={<WhatshotRoundedIcon />}
+                  label="Burn after read"
+                  color="warning"
+                  variant="outlined"
+                />
               )}
             </Stack>
           </Stack>
@@ -1479,6 +1854,118 @@ function DetailMetric(props: { label: string; value: string }) {
   );
 }
 
+function useLatestRef<T>(value: T) {
+  const ref = useRef(value);
+
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+
+  return ref;
+}
+
+function resolveNextActiveConversationId(
+  desiredConversationId: string | null,
+  conversations: ConversationSummary[],
+  isMobile: boolean
+) {
+  if (
+    desiredConversationId &&
+    conversations.some((conversation) => conversation.id === desiredConversationId)
+  ) {
+    return desiredConversationId;
+  }
+
+  return isMobile ? null : conversations[0]?.id ?? null;
+}
+
+function shouldRefreshConversationDetail(
+  conversation: ConversationSummary | null,
+  cachedConversation: ConversationCacheEntry | undefined,
+  force: boolean
+) {
+  if (!conversation) {
+    return false;
+  }
+
+  if (force || !cachedConversation) {
+    return true;
+  }
+
+  const hasPendingMessages = cachedConversation.messages.some((message) => message.clientStatus);
+  const latestCachedMessageAt = cachedConversation.messages.at(-1)?.createdAt ?? null;
+
+  return hasPendingMessages || conversation.lastMessageAt !== latestCachedMessageAt;
+}
+
+function countUnreadMessages(
+  messages: ChatMessage[],
+  userId: string | null,
+  lastSeenAt: string | undefined
+) {
+  return messages.filter((message) => {
+    if (message.senderUserId === userId) {
+      return false;
+    }
+
+    if (!lastSeenAt) {
+      return true;
+    }
+
+    return new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime();
+  }).length;
+}
+
+function buildConversationMetaMap(
+  conversations: ConversationSummary[],
+  cache: Record<string, ConversationCacheEntry>,
+  previous: Record<string, ConversationMeta>,
+  seenMap: Record<string, string>,
+  userId: string | null
+) {
+  const nextMeta: Record<string, ConversationMeta> = {};
+
+  for (const conversation of conversations) {
+    const cachedConversation = cache[conversation.id];
+    if (cachedConversation?.messages.length) {
+      const lastMessage = cachedConversation.messages.at(-1) ?? null;
+      nextMeta[conversation.id] = {
+        preview:
+          lastMessage?.markdown
+            ? toPreview(lastMessage.markdown)
+            : previous[conversation.id]?.preview ??
+              conversation.counterpart?.email ??
+              "Encrypted channel",
+        unreadCount: countUnreadMessages(
+          cachedConversation.messages,
+          userId,
+          seenMap[conversation.id]
+        ),
+        lastMessageAt: lastMessage?.createdAt ?? conversation.lastMessageAt ?? null
+      };
+      continue;
+    }
+
+    const hasUnread =
+      Boolean(conversation.lastMessageAt) &&
+      (!seenMap[conversation.id] ||
+        new Date(conversation.lastMessageAt!).getTime() >
+          new Date(seenMap[conversation.id]).getTime());
+
+    nextMeta[conversation.id] = {
+      preview:
+        previous[conversation.id]?.preview ??
+        conversation.counterpart?.email ??
+        "Encrypted channel",
+      unreadCount: hasUnread ? Math.max(previous[conversation.id]?.unreadCount ?? 0, 1) : 0,
+      lastMessageAt:
+        conversation.lastMessageAt ?? previous[conversation.id]?.lastMessageAt ?? null
+    };
+  }
+
+  return nextMeta;
+}
+
 function loadSeenMap(): Record<string, string> {
   if (typeof window === "undefined") {
     return {};
@@ -1503,7 +1990,10 @@ function saveSeenMap(seenMap: Record<string, string>) {
 }
 
 function toPreview(markdown: string): string {
-  return markdown.replace(/[#*_`>\-\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 54) || "New message";
+  return (
+    markdown.replace(/[#*_`>\-\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 54) ||
+    "New message"
+  );
 }
 
 function getInitial(value: string | null | undefined) {
@@ -1530,5 +2020,11 @@ function formatDateTime(value: string) {
     day: "numeric",
     hour: "2-digit",
     minute: "2-digit"
+  });
+}
+
+function sleep(milliseconds: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, milliseconds);
   });
 }

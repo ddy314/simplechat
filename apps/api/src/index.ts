@@ -11,7 +11,8 @@ import {
   type FriendSummary,
   type LocalAuthInput,
   type OAuthProviderConfig,
-  type SessionResponse
+  type SessionResponse,
+  type WorkspaceSnapshot
 } from "@simplechat/protocol";
 
 type Bindings = {
@@ -412,6 +413,21 @@ app.get("/api/friends/requests", requireSession, async (c) => {
   const session = c.get("session")!;
   const requests = await listFriendRequests(c.env.DB, session.userId);
   return c.json({ requests });
+});
+
+app.get("/api/workspace", requireSession, async (c) => {
+  const session = c.get("session")!;
+  const [friends, requests, conversations] = await Promise.all([
+    listFriends(c.env.DB, session.userId),
+    listFriendRequests(c.env.DB, session.userId),
+    listConversations(c.env.DB, session.userId)
+  ]);
+
+  return c.json({
+    friends,
+    requests,
+    conversations
+  } satisfies WorkspaceSnapshot);
 });
 
 app.post("/api/friends/requests", requireSession, async (c) => {
@@ -879,25 +895,28 @@ async function loadConversationDetail(
     .bind(conversationId)
     .all<MessageIndexRow>();
 
-  const messages = [];
-  for (const row of messageRows.results) {
-    const object = await bucket.get(row.r2_key);
-    if (!object) {
-      continue;
-    }
+  const messages = (
+    await Promise.all(
+      messageRows.results.map(async (row) => {
+        const object = await bucket.get(row.r2_key);
+        if (!object) {
+          return null;
+        }
 
-    const envelope = (await object.json()) as CiphertextEnvelope;
-    messages.push({
-      id: row.id,
-      senderUserId: row.sender_user_id,
-      senderDisplayName: row.sender_display_name,
-      senderAvatarUrl: row.sender_avatar_url,
-      createdAt: row.created_at,
-      expiresAt: row.expires_at,
-      burnAfterRead: Boolean(row.burn_after_read),
-      envelope
-    });
-  }
+        const envelope = (await object.json()) as CiphertextEnvelope;
+        return {
+          id: row.id,
+          senderUserId: row.sender_user_id,
+          senderDisplayName: row.sender_display_name,
+          senderAvatarUrl: row.sender_avatar_url,
+          createdAt: row.created_at,
+          expiresAt: row.expires_at,
+          burnAfterRead: Boolean(row.burn_after_read),
+          envelope
+        };
+      })
+    )
+  ).filter((message): message is ConversationDetail["messages"][number] => message !== null);
 
   return {
     conversation,

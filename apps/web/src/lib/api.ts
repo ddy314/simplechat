@@ -6,7 +6,8 @@ import type {
   FriendSummary,
   LocalAuthInput,
   OAuthProviderConfig,
-  SessionResponse
+  SessionResponse,
+  WorkspaceSnapshot
 } from "@simplechat/protocol";
 
 const jsonHeaders = {
@@ -98,6 +99,10 @@ export class ApiClient {
 
   getConversations(): Promise<{ conversations: ConversationSummary[] }> {
     return this.request("/api/conversations", { method: "GET" });
+  }
+
+  getWorkspace(): Promise<WorkspaceSnapshot> {
+    return this.request("/api/workspace", { method: "GET" });
   }
 
   getConversation(conversationId: string): Promise<ConversationDetail> {

@@ -62,6 +62,12 @@ export interface FriendRequestSummary {
   createdAt: string;
 }
 
+export interface WorkspaceSnapshot {
+  friends: FriendSummary[];
+  requests: FriendRequestSummary[];
+  conversations: ConversationSummary[];
+}
+
 export interface ConversationSummary {
   id: string;
   kind: "direct";
