@@ -18,6 +18,7 @@ import {
   Switch,
   TextField,
   Toolbar,
+  Badge,
   Typography
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
@@ -46,6 +47,14 @@ type SessionState =
       };
     };
 
+type ConversationMeta = {
+  preview: string;
+  unreadCount: number;
+  lastMessageAt: string | null;
+};
+
+const SEEN_STORAGE_KEY = "simplechat_seen_map";
+
 export default function App() {
   const [providers, setProviders] = useState<OAuthProviderConfig[]>([]);
   const [session, setSession] = useState<SessionState>({ loading: true });
@@ -67,6 +76,8 @@ export default function App() {
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
   const [authDisplayName, setAuthDisplayName] = useState("");
+  const [conversationMeta, setConversationMeta] = useState<Record<string, ConversationMeta>>({});
+  const [seenMap, setSeenMap] = useState<Record<string, string>>(() => loadSeenMap());
   const readMarksRef = useRef(new Set<string>());
   const currentUser = !session.loading ? session.user : null;
 
@@ -87,17 +98,17 @@ export default function App() {
   }, [currentUser, session.loading]);
 
   useEffect(() => {
-    if (!activeConversationId || !currentUser) {
+    if (!currentUser || !device) {
       return;
     }
 
-    void loadConversation(activeConversationId);
+    void syncWorkspace(activeConversationId);
     const timer = window.setInterval(() => {
-      void loadConversation(activeConversationId);
-    }, 4000);
+      void syncWorkspace(activeConversationId);
+    }, 5000);
 
     return () => window.clearInterval(timer);
-  }, [activeConversationId, currentUser, device?.deviceId, session.loading]);
+  }, [activeConversationId, currentUser, device?.deviceId]);
 
   async function bootstrap() {
     try {
@@ -135,38 +146,89 @@ export default function App() {
       setRequests(requestsResponse.requests);
       setConversations(conversationsResponse.conversations);
       setActiveConversationId((current) => current ?? conversationsResponse.conversations[0]?.id ?? null);
+      await syncConversationMeta(
+        conversationsResponse.conversations,
+        identity,
+        currentUser?.id ?? null,
+        activeConversationId
+      );
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to load encrypted workspace.");
     }
   }
 
-  async function loadConversation(conversationId: string) {
+  async function syncWorkspace(targetConversationId: string | null) {
     if (!device) {
       return;
     }
 
     try {
-      const detail = await api.getConversation(conversationId);
+      const [friendsResponse, requestsResponse, conversationsResponse] = await Promise.all([
+        api.getFriends(),
+        api.getFriendRequests(),
+        api.getConversations()
+      ]);
+      setFriends(friendsResponse.friends);
+      setRequests(requestsResponse.requests);
+      setConversations(conversationsResponse.conversations);
+      await syncConversationMeta(
+        conversationsResponse.conversations,
+        device,
+        currentUser?.id ?? null,
+        targetConversationId
+      );
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Failed to sync workspace.");
+    }
+  }
+
+  async function syncConversationMeta(
+    items: ConversationSummary[],
+    identity: DeviceIdentity,
+    userId: string | null,
+    targetConversationId: string | null
+  ) {
+    const nextMeta: Record<string, ConversationMeta> = {};
+
+    for (const conversation of items) {
+      const detail = await api.getConversation(conversation.id);
       const decrypted = await Promise.all(
-        detail.messages.map((message: any) => decryptMessage(device, message))
+        detail.messages.map((message: any) => decryptMessage(identity, message))
       );
       const visible = decrypted.filter(Boolean) as DecryptedMessage[];
-      setConversationDetail(detail);
-      setMessages(visible);
+      const lastMessage = visible.at(-1) ?? null;
+      const lastSeenAt = seenMap[conversation.id];
+      const unreadCount = visible.filter(
+        (message) =>
+          message.senderUserId !== userId &&
+          (!lastSeenAt || new Date(message.createdAt).getTime() > new Date(lastSeenAt).getTime())
+      ).length;
 
-      for (const message of visible) {
-        if (
-          message.burnAfterRead &&
-          message.senderUserId !== currentUser?.id &&
-          !readMarksRef.current.has(message.id)
-        ) {
-          readMarksRef.current.add(message.id);
-          void api.markMessageRead(conversationId, message.id);
+      nextMeta[conversation.id] = {
+        preview: lastMessage ? toPreview(lastMessage.markdown) : "",
+        unreadCount: conversation.id === targetConversationId ? 0 : unreadCount,
+        lastMessageAt: lastMessage?.createdAt ?? null
+      };
+
+      if (conversation.id === targetConversationId) {
+        setConversationDetail(detail);
+        setMessages(visible);
+        markConversationSeen(conversation.id, visible);
+
+        for (const message of visible) {
+          if (
+            message.burnAfterRead &&
+            message.senderUserId !== userId &&
+            !readMarksRef.current.has(message.id)
+          ) {
+            readMarksRef.current.add(message.id);
+            void api.markMessageRead(conversation.id, message.id);
+          }
         }
       }
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Failed to load conversation.");
     }
+
+    setConversationMeta(nextMeta);
   }
 
   async function handleSendMessage() {
@@ -190,9 +252,7 @@ export default function App() {
       });
       await api.sendMessage(activeConversationId, envelope);
       setComposer("");
-      await loadConversation(activeConversationId);
-      const conversationsResponse = await api.getConversations();
-      setConversations(conversationsResponse.conversations);
+      await syncWorkspace(activeConversationId);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to send message.");
     } finally {
@@ -232,7 +292,23 @@ export default function App() {
 
   async function handleLogout() {
     await api.logout();
+    window.localStorage.removeItem(SEEN_STORAGE_KEY);
     window.location.reload();
+  }
+
+  function markConversationSeen(conversationId: string, visible: DecryptedMessage[]) {
+    if (!visible.length) {
+      return;
+    }
+
+    setSeenMap((previous) => {
+      const nextSeenMap = {
+        ...previous,
+        [conversationId]: visible[visible.length - 1].createdAt
+      };
+      saveSeenMap(nextSeenMap);
+      return nextSeenMap;
+    });
   }
 
   async function handleLocalAuth() {
@@ -378,6 +454,7 @@ export default function App() {
         >
           <SidebarContent
             conversations={conversations}
+            conversationMeta={conversationMeta}
             activeConversationId={activeConversationId}
             onSelectConversation={(id) => {
               setActiveConversationId(id);
@@ -395,6 +472,7 @@ export default function App() {
         <Paper className="sidebar desktop-only" elevation={0}>
           <SidebarContent
             conversations={conversations}
+            conversationMeta={conversationMeta}
             activeConversationId={activeConversationId}
             onSelectConversation={setActiveConversationId}
             friends={friends}
@@ -497,6 +575,7 @@ export default function App() {
 
 function SidebarContent(props: {
   conversations: ConversationSummary[];
+  conversationMeta: Record<string, ConversationMeta>;
   activeConversationId: string | null;
   onSelectConversation: (id: string) => void;
   friends: any[];
@@ -518,8 +597,24 @@ function SidebarContent(props: {
               onClick={() => props.onSelectConversation(conversation.id)}
             >
               <ListItemText
-                primary={conversation.counterpart?.displayName ?? "Direct conversation"}
-                secondary={conversation.counterpart?.email ?? "Encrypted channel"}
+                primary={
+                  <Stack direction="row" alignItems="center" justifyContent="space-between">
+                    <Typography variant="body2">
+                      {conversation.counterpart?.displayName ?? "Direct conversation"}
+                    </Typography>
+                    {props.conversationMeta[conversation.id]?.unreadCount > 0 && (
+                      <Badge
+                        color="primary"
+                        badgeContent={props.conversationMeta[conversation.id]?.unreadCount}
+                      />
+                    )}
+                  </Stack>
+                }
+                secondary={
+                  props.conversationMeta[conversation.id]?.preview ||
+                  conversation.counterpart?.email ||
+                  "Encrypted channel"
+                }
               />
             </ListItemButton>
           ))}
@@ -570,4 +665,31 @@ function SidebarContent(props: {
       </Box>
     </Stack>
   );
+}
+
+function loadSeenMap(): Record<string, string> {
+  if (typeof window === "undefined") {
+    return {};
+  }
+
+  try {
+    return JSON.parse(window.localStorage.getItem(SEEN_STORAGE_KEY) ?? "{}") as Record<
+      string,
+      string
+    >;
+  } catch {
+    return {};
+  }
+}
+
+function saveSeenMap(seenMap: Record<string, string>) {
+  if (typeof window === "undefined") {
+    return;
+  }
+
+  window.localStorage.setItem(SEEN_STORAGE_KEY, JSON.stringify(seenMap));
+}
+
+function toPreview(markdown: string): string {
+  return markdown.replace(/[#*_`>\-\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 36) || "New message";
 }
