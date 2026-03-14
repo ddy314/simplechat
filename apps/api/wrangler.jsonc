@@ -5,13 +5,13 @@
   "compatibility_date": "2026-03-12",
   "compatibility_flags": ["nodejs_compat"],
   "vars": {
-    "APP_ORIGIN": "http://localhost:5173"
+    "APP_ORIGIN": "https://simplechat-web.pages.dev"
   },
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "simplechat-db",
-      "database_id": "replace-me"
+      "database_id": "208abf08-5560-43c1-be10-a82820944163"
     }
   ],
   "r2_buckets": [
@@ -27,4 +27,3 @@
     "enabled": true
   }
 }
-
