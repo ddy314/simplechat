@@ -4,6 +4,7 @@ import type {
   DeviceRecord,
   FriendRequestSummary,
   FriendSummary,
+  LocalAuthInput,
   OAuthProviderConfig,
   SessionResponse
 } from "@simplechat/protocol";
@@ -39,6 +40,20 @@ export class ApiClient {
 
   getSession(): Promise<SessionResponse> {
     return this.request("/auth/session", { method: "GET" });
+  }
+
+  register(input: LocalAuthInput): Promise<{ ok: boolean }> {
+    return this.request("/auth/register", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
+  }
+
+  login(input: LocalAuthInput): Promise<{ ok: boolean }> {
+    return this.request("/auth/login", {
+      method: "POST",
+      body: JSON.stringify(input)
+    });
   }
 
   logout(): Promise<{ ok: boolean }> {
@@ -107,4 +122,3 @@ export class ApiClient {
 export const api = new ApiClient(
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787"
 );
-

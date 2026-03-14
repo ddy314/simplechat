@@ -8,9 +8,10 @@ SimpleChat 是一个基于 Cloudflare Pages + Workers + D1 + R2 构建的端到�
 - 消息正文密文落 R2，D1 只保存索引与生命周期元数据。
 - 支持消息到期焚烧，Worker 定时清理 D1 与 R2 中的过期数据。
 - 使用长度分桶与随机填充降低流量特征暴露。
-- OAuth 登录骨架内置 Google / GitHub，可继续扩展更多身份源。
+- 本地邮箱密码注册登录已内置，OAuth 骨架保留 Google / GitHub，可继续扩展更多身份源。
 - Material Design 3 风格界面，布局参考 Gmail，多栏聊天体验。
 - Markdown 消息渲染，默认启用 GFM 并进行白名单清洗。
+- 为避免超过 R2 免费额度，默认启用保守硬限制：8 KB 单条密文、128 MB 活跃密文总量、单用户 250 条/日。
 
 ## 重要安全说明
 
@@ -36,7 +37,7 @@ SimpleChat 是一个基于 Cloudflare Pages + Workers + D1 + R2 构建的端到�
 ### API (`apps/api`)
 
 - Cloudflare Worker + Hono
-- OAuth 登录、会话管理、好友管理、会话与消息 API
+- 本地登录、OAuth 骨架、会话管理、好友管理、会话与消息 API
 - Cron 定时清理过期消息
 - D1 保存用户 / 设备 / 关系 / 消息索引
 - R2 保存密文消息对象
@@ -98,4 +99,3 @@ npm run dev:web
 - API 部署到 Cloudflare Workers
 - Pages 通过 `VITE_API_BASE_URL` 指向 Worker 域名
 - 生产环境必须使用 HTTPS、自定义域、严格 CSP 与 `SameSite=None; Secure`
-

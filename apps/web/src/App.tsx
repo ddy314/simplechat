@@ -65,6 +65,10 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authDisplayName, setAuthDisplayName] = useState("");
   const readMarksRef = useRef(new Set<string>());
   const currentUser = !session.loading ? session.user : null;
 
@@ -72,6 +76,7 @@ export default function App() {
     () => conversations.find((item) => item.id === activeConversationId) ?? null,
     [activeConversationId, conversations]
   );
+  const oauthProviders = providers.filter((provider) => provider.id !== "local" && provider.enabled);
 
   useEffect(() => {
     void bootstrap();
@@ -232,6 +237,31 @@ export default function App() {
     window.location.reload();
   }
 
+  async function handleLocalAuth() {
+    setBusy(true);
+    try {
+      if (authMode === "register") {
+        await api.register({
+          email: authEmail,
+          password: authPassword,
+          displayName: authDisplayName
+        });
+      } else {
+        await api.login({
+          email: authEmail,
+          password: authPassword
+        });
+      }
+
+      setAuthPassword("");
+      await bootstrap();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Authentication failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (session.loading) {
     return (
       <Box className="centered">
@@ -254,7 +284,45 @@ export default function App() {
               </Typography>
             </Stack>
             <Stack spacing={1.5}>
-              {providers.filter((provider) => provider.enabled).map((provider) => (
+              <Stack direction="row" spacing={1}>
+                <Chip
+                  label="Login"
+                  color={authMode === "login" ? "primary" : "default"}
+                  clickable
+                  onClick={() => setAuthMode("login")}
+                />
+                <Chip
+                  label="Register"
+                  color={authMode === "register" ? "primary" : "default"}
+                  clickable
+                  onClick={() => setAuthMode("register")}
+                />
+              </Stack>
+              {authMode === "register" && (
+                <TextField
+                  label="Display name"
+                  value={authDisplayName}
+                  onChange={(event) => setAuthDisplayName(event.target.value)}
+                />
+              )}
+              <TextField
+                label="Email"
+                type="email"
+                value={authEmail}
+                onChange={(event) => setAuthEmail(event.target.value)}
+              />
+              <TextField
+                label="Password"
+                type="password"
+                value={authPassword}
+                onChange={(event) => setAuthPassword(event.target.value)}
+                helperText="Minimum 10 characters. Password hash is stored in D1."
+              />
+              <Button variant="contained" size="large" onClick={handleLocalAuth} disabled={busy}>
+                {authMode === "register" ? "Create secure account" : "Sign in"}
+              </Button>
+              <Divider>Optional OAuth later</Divider>
+              {oauthProviders.map((provider) => (
                 <Button
                   key={provider.id}
                   variant="contained"
@@ -264,11 +332,15 @@ export default function App() {
                   Continue with {provider.name}
                 </Button>
               ))}
-              {providers.every((provider) => !provider.enabled) && (
+              {oauthProviders.length === 0 && (
                 <Alert severity="warning">
-                  OAuth providers are not configured yet. Add provider secrets in the Worker env.
+                  OAuth providers are not configured yet. Local email/password auth is enabled.
                 </Alert>
               )}
+              <Alert severity="info">
+                R2 free-tier guardrails are active: 8 KB max encrypted envelope, 250 messages per
+                user per day, 128 MB active ciphertext cap.
+              </Alert>
             </Stack>
           </Stack>
         </Paper>

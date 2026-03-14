@@ -10,7 +10,7 @@ export const PADDING_BUCKETS = [512, 1024, 2048, 4096, 8192, 16384] as const;
 export type TtlPresetValue = (typeof TTL_PRESETS)[number]["value"];
 
 export interface OAuthProviderConfig {
-  id: "google" | "github";
+  id: "local" | "google" | "github";
   name: string;
   enabled: boolean;
 }
@@ -25,6 +25,12 @@ export interface SessionUser {
 export interface SessionResponse {
   authenticated: boolean;
   user: SessionUser | null;
+}
+
+export interface LocalAuthInput {
+  email: string;
+  password: string;
+  displayName?: string;
 }
 
 export interface DeviceRecord {

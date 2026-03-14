@@ -9,6 +9,7 @@ import {
   type DeviceRecord,
   type FriendRequestSummary,
   type FriendSummary,
+  type LocalAuthInput,
   type OAuthProviderConfig,
   type SessionResponse
 } from "@simplechat/protocol";
@@ -67,6 +68,12 @@ interface MessageIndexRow {
 const SESSION_COOKIE = "simplechat_session";
 const OAUTH_STATE_COOKIE = "simplechat_oauth_state";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 14;
+const PASSWORD_ITERATIONS = 210_000;
+const MAX_ENVELOPE_BYTES = 8 * 1024;
+const MAX_ACTIVE_R2_BYTES = 128 * 1024 * 1024;
+const MAX_R2_WRITES_PER_DAY = 5_000;
+const MAX_R2_READS_PER_DAY = 20_000;
+const MAX_MESSAGES_PER_USER_PER_DAY = 250;
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
@@ -132,6 +139,11 @@ app.get("/health", (c) => c.json({ ok: true, now: new Date().toISOString() }));
 app.get("/auth/providers", (c) => {
   const providers: OAuthProviderConfig[] = [
     {
+      id: "local",
+      name: "Email & Password",
+      enabled: true
+    },
+    {
       id: "google",
       name: "Google",
       enabled: Boolean(
@@ -168,6 +180,87 @@ app.get("/auth/session", (c) => {
       }
     : { authenticated: false, user: null };
   return c.json(payload);
+});
+
+app.post("/auth/register", async (c) => {
+  const body = await c.req.json<LocalAuthInput>();
+  const email = normalizeEmail(body.email);
+  const password = body.password?.trim();
+  const displayName = body.displayName?.trim() || email.split("@")[0];
+
+  if (!email || !password || password.length < 10) {
+    return c.json({ error: "Email and a password of at least 10 characters are required." }, 400);
+  }
+
+  const existing = await c.env.DB.prepare("SELECT id FROM users WHERE lower(email) = ?1")
+    .bind(email)
+    .first<{ id: string }>();
+  if (existing) {
+    return c.json({ error: "This email is already registered." }, 409);
+  }
+
+  const userId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  const passwordHash = await hashPassword(password, saltBytes, PASSWORD_ITERATIONS);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `
+        INSERT INTO users (id, email, display_name, avatar_url, created_at, updated_at)
+        VALUES (?1, ?2, ?3, NULL, ?4, ?4)
+      `
+    ).bind(userId, email, displayName, now),
+    c.env.DB.prepare(
+      `
+        INSERT INTO user_credentials (user_id, password_hash, password_salt, password_iterations, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+      `
+    ).bind(userId, passwordHash, toBase64Url(saltBytes), PASSWORD_ITERATIONS, now)
+  ]);
+
+  await createSession(c, userId);
+  return c.json({ ok: true }, 201);
+});
+
+app.post("/auth/login", async (c) => {
+  const body = await c.req.json<LocalAuthInput>();
+  const email = normalizeEmail(body.email);
+  const password = body.password?.trim();
+  if (!email || !password) {
+    return c.json({ error: "Email and password are required." }, 400);
+  }
+
+  const credential = await c.env.DB.prepare(
+    `
+      SELECT users.id AS user_id, uc.password_hash, uc.password_salt, uc.password_iterations
+      FROM users
+      JOIN user_credentials uc ON uc.user_id = users.id
+      WHERE lower(users.email) = ?1
+    `
+  )
+    .bind(email)
+    .first<{
+      user_id: string;
+      password_hash: string;
+      password_salt: string;
+      password_iterations: number;
+    }>();
+
+  if (!credential) {
+    return c.json({ error: "Invalid email or password." }, 401);
+  }
+
+  const computedHash = await hashPassword(
+    password,
+    fromBase64Url(credential.password_salt),
+    credential.password_iterations
+  );
+  if (computedHash !== credential.password_hash) {
+    return c.json({ error: "Invalid email or password." }, 401);
+  }
+
+  await createSession(c, credential.user_id);
+  return c.json({ ok: true });
 });
 
 app.get("/auth/oauth/:provider/start", async (c) => {
@@ -220,28 +313,7 @@ app.get("/auth/oauth/:provider/callback", async (c) => {
   }
 
   const userId = await findOrCreateUser(c.env.DB, provider, profile);
-  const sessionToken = randomToken();
-  const sessionTokenHash = await sha256Hex(sessionToken + c.env.SESSION_SECRET);
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
-  const sessionId = crypto.randomUUID();
-
-  await c.env.DB.prepare(
-    `
-      INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_seen_at)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-    `
-  )
-    .bind(sessionId, userId, sessionTokenHash, expiresAt, now.toISOString())
-    .run();
-
-  setCookie(c, SESSION_COOKIE, sessionToken, {
-    httpOnly: true,
-    secure: true,
-    sameSite: "None",
-    path: "/",
-    maxAge: SESSION_TTL_SECONDS
-  });
+  await createSession(c, userId);
 
   return c.redirect(c.env.APP_ORIGIN, 302);
 });
@@ -449,6 +521,7 @@ app.get("/api/conversations/:conversationId", requireSession, async (c) => {
     return c.json({ error: "Conversation not found." }, 404);
   }
 
+  await incrementUsageCounter(c.env.DB, "r2_reads_day", 1, MAX_R2_READS_PER_DAY);
   const detail = await loadConversationDetail(
     c.env.DB,
     c.env.MESSAGE_BLOB,
@@ -505,11 +578,22 @@ app.post("/api/conversations/:conversationId/messages", requireSession, async (c
   };
 
   const serialized = JSON.stringify(normalizedEnvelope);
+  if (serialized.length > MAX_ENVELOPE_BYTES) {
+    return c.json({ error: "Encrypted message exceeds the free-tier storage cap." }, 400);
+  }
+
+  const quotaCheck = await assertR2QuotaAvailable(c.env.DB, session.userId, serialized.length);
+  if (quotaCheck) {
+    return c.json({ error: quotaCheck }, 429);
+  }
+
   const objectKey = `messages/${conversationId}/${normalizedEnvelope.messageId}.json`;
 
   await c.env.MESSAGE_BLOB.put(objectKey, serialized, {
     httpMetadata: { contentType: "application/octet-stream" }
   });
+
+  await incrementUsageCounter(c.env.DB, "r2_writes_day", 1, MAX_R2_WRITES_PER_DAY);
 
   await c.env.DB.prepare(
     `
@@ -825,6 +909,71 @@ async function loadConversationDetail(
   };
 }
 
+async function assertR2QuotaAvailable(
+  db: D1Database,
+  userId: string,
+  messageBytes: number
+): Promise<string | null> {
+  const [activeUsage, senderDailyUsage] = await Promise.all([
+    db.prepare("SELECT COALESCE(SUM(ciphertext_bytes), 0) AS total_bytes FROM messages")
+      .first<{ total_bytes: number }>(),
+    db.prepare(
+      `
+        SELECT COUNT(*) AS message_count
+        FROM messages
+        WHERE sender_user_id = ?1 AND created_at >= ?2
+      `
+    )
+      .bind(userId, new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
+      .first<{ message_count: number }>()
+  ]);
+
+  if ((activeUsage?.total_bytes ?? 0) + messageBytes > MAX_ACTIVE_R2_BYTES) {
+    return "R2 active storage cap reached. Wait for burn timers to clear older messages.";
+  }
+
+  if ((senderDailyUsage?.message_count ?? 0) >= MAX_MESSAGES_PER_USER_PER_DAY) {
+    return "Daily encrypted message cap reached for this account.";
+  }
+
+  try {
+    await incrementUsageCounter(db, "r2_writes_day", 0, MAX_R2_WRITES_PER_DAY);
+  } catch {
+    return "Daily R2 write cap reached.";
+  }
+
+  return null;
+}
+
+async function incrementUsageCounter(
+  db: D1Database,
+  metric: string,
+  incrementBy: number,
+  maxValue: number
+): Promise<void> {
+  const today = new Date().toISOString().slice(0, 10);
+  const key = `${metric}:${today}`;
+  const existing = await db.prepare(
+    "SELECT value FROM usage_counters WHERE metric = ?1"
+  )
+    .bind(key)
+    .first<{ value: number }>();
+  const nextValue = (existing?.value ?? 0) + incrementBy;
+  if (nextValue > maxValue) {
+    throw new Error(`Usage cap exceeded for ${metric}`);
+  }
+
+  await db.prepare(
+    `
+      INSERT INTO usage_counters (metric, value, updated_at)
+      VALUES (?1, ?2, ?3)
+      ON CONFLICT(metric) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `
+  )
+    .bind(key, nextValue, new Date().toISOString())
+    .run();
+}
+
 async function ensureDirectConversation(db: D1Database, userIds: [string, string]): Promise<string> {
   const existing = await db.prepare(
     `
@@ -1093,11 +1242,61 @@ function validateEnvelope(envelope: CiphertextEnvelope): boolean {
   );
 }
 
+async function createSession(c: any, userId: string): Promise<void> {
+  const sessionToken = randomToken();
+  const sessionTokenHash = await sha256Hex(sessionToken + c.env.SESSION_SECRET);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000).toISOString();
+  const sessionId = crypto.randomUUID();
+
+  await c.env.DB.prepare(
+    `
+      INSERT INTO sessions (id, user_id, token_hash, expires_at, created_at, last_seen_at)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+    `
+  )
+    .bind(sessionId, userId, sessionTokenHash, expiresAt, now.toISOString())
+    .run();
+
+  setCookie(c, SESSION_COOKIE, sessionToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "None",
+    path: "/",
+    maxAge: SESSION_TTL_SECONDS
+  });
+}
+
 async function sha256Hex(value: string): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest))
     .map((byte) => byte.toString(16).padStart(2, "0"))
     .join("");
+}
+
+async function hashPassword(
+  password: string,
+  salt: Uint8Array,
+  iterations: number
+): Promise<string> {
+  const passwordKey = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: Uint8Array.from(salt),
+      iterations
+    },
+    passwordKey,
+    256
+  );
+  return toBase64Url(new Uint8Array(bits));
 }
 
 function randomToken(): string {
@@ -1106,6 +1305,23 @@ function randomToken(): string {
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
+}
+
+function normalizeEmail(value?: string): string {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+}
+
+function fromBase64Url(value: string): Uint8Array {
+  const normalized = value.replaceAll("-", "+").replaceAll("_", "/");
+  const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+  return Uint8Array.from(atob(normalized + padding), (char) => char.charCodeAt(0));
 }
 
 export default {
@@ -1131,7 +1347,10 @@ export default {
 
     await env.DB.batch([
       env.DB.prepare("DELETE FROM sessions WHERE expires_at <= ?1").bind(now),
-      env.DB.prepare("DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at <= ?1").bind(now)
+      env.DB.prepare("DELETE FROM devices WHERE revoked_at IS NOT NULL AND revoked_at <= ?1").bind(now),
+      env.DB.prepare("DELETE FROM usage_counters WHERE updated_at <= ?1").bind(
+        new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
+      )
     ]);
   }
 };
