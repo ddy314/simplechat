@@ -21,9 +21,7 @@ import {
   Typography
 } from "@mui/material";
 import AddIcon from "@mui/icons-material/Add";
-import LockIcon from "@mui/icons-material/Lock";
 import LogoutIcon from "@mui/icons-material/Logout";
-import ShieldIcon from "@mui/icons-material/Shield";
 import { TTL_PRESETS, type ConversationSummary, type OAuthProviderConfig } from "@simplechat/protocol";
 import { api } from "./lib/api";
 import {
@@ -274,19 +272,15 @@ export default function App() {
     return (
       <Box className="login-shell">
         <Paper className="login-card" elevation={0}>
-          <Stack spacing={3}>
+          <Stack spacing={2.5}>
             {notice && (
               <Alert severity="error" onClose={() => setNotice(null)}>
                 {notice}
               </Alert>
             )}
-            <Stack spacing={1}>
-              <Chip icon={<LockIcon />} label="E2EE by default" sx={{ alignSelf: "flex-start" }} />
+            <Stack spacing={0.5}>
               <Typography variant="h4">SimpleChat</Typography>
-              <Typography color="text.secondary">
-                Cloudflare-backed encrypted messaging with local-only decryption, timed burn,
-                Markdown messages, and device-scoped identity keys.
-              </Typography>
+              <Typography color="text.secondary">Login or create an account</Typography>
             </Stack>
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1}>
@@ -321,31 +315,26 @@ export default function App() {
                 type="password"
                 value={authPassword}
                 onChange={(event) => setAuthPassword(event.target.value)}
-                helperText="Minimum 10 characters. Password hash is stored in D1."
+                helperText={authMode === "register" ? "Minimum 10 characters" : undefined}
               />
               <Button variant="contained" size="large" onClick={handleLocalAuth} disabled={busy}>
                 {authMode === "register" ? "Create secure account" : "Sign in"}
               </Button>
-              <Divider>Optional OAuth later</Divider>
-              {oauthProviders.map((provider) => (
-                <Button
-                  key={provider.id}
-                  variant="contained"
-                  size="large"
-                  href={`${import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787"}/auth/oauth/${provider.id}/start`}
-                >
-                  Continue with {provider.name}
-                </Button>
-              ))}
-              {oauthProviders.length === 0 && (
-                <Alert severity="warning">
-                  OAuth providers are not configured yet. Local email/password auth is enabled.
-                </Alert>
+              {oauthProviders.length > 0 && (
+                <>
+                  <Divider />
+                  {oauthProviders.map((provider) => (
+                    <Button
+                      key={provider.id}
+                      variant="outlined"
+                      size="large"
+                      href={`${import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8787"}/auth/oauth/${provider.id}/start`}
+                    >
+                      Continue with {provider.name}
+                    </Button>
+                  ))}
+                </>
               )}
-              <Alert severity="info">
-                R2 free-tier guardrails are active: 8 KB max encrypted envelope, 250 messages per
-                user per day, 128 MB active ciphertext cap.
-              </Alert>
             </Stack>
           </Stack>
         </Paper>
@@ -359,13 +348,14 @@ export default function App() {
         <Toolbar className="topbar">
           <Stack direction="row" spacing={1.5} alignItems="center">
             <IconButton onClick={() => setSidebarOpen(true)} className="mobile-only">
-              <ShieldIcon />
+              <AddIcon />
             </IconButton>
-            <Typography variant="h5">SimpleChat Secure</Typography>
-            <Chip icon={<ShieldIcon />} label="Server stores ciphertext only" />
+            <Typography variant="h5">SimpleChat</Typography>
           </Stack>
           <Stack direction="row" spacing={1} alignItems="center">
-            <Chip label={device?.label ?? "Provisioning key"} color="primary" variant="outlined" />
+            <Typography color="text.secondary" variant="body2">
+              {currentUser?.displayName}
+            </Typography>
             <Button startIcon={<LogoutIcon />} onClick={handleLogout}>
               Sign out
             </Button>
@@ -426,7 +416,7 @@ export default function App() {
                 {activeConversation?.counterpart?.displayName ?? "Select a conversation"}
               </Typography>
               <Typography color="text.secondary">
-                Burn window: {Math.round((activeConversation?.expiresInSeconds ?? selectedTtl) / 60)}m
+                {activeConversation?.counterpart?.email ?? "No active chat"}
               </Typography>
             </Box>
           </Stack>
@@ -455,11 +445,7 @@ export default function App() {
             })}
             {!messages.length && (
               <Box className="empty-state">
-                <Typography variant="h6">No messages yet</Typography>
-                <Typography color="text.secondary">
-                  Start the conversation with a Markdown message. The server will store only the
-                  encrypted envelope.
-                </Typography>
+                <Typography variant="h6">No messages</Typography>
               </Box>
             )}
           </Stack>
@@ -472,7 +458,7 @@ export default function App() {
               multiline
               value={composer}
               onChange={(event) => setComposer(event.target.value)}
-              placeholder="Write encrypted Markdown..."
+              placeholder="Message"
             />
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
               {TTL_PRESETS.map((preset) => (
@@ -491,7 +477,7 @@ export default function App() {
             </Stack>
             <Stack direction="row" justifyContent="space-between" alignItems="center">
               <Typography color="text.secondary" variant="body2">
-                Padding and envelope encryption happen locally before upload.
+                {burnAfterRead ? "Burn after read on" : `Auto delete ${Math.round(selectedTtl / 60)}m`}
               </Typography>
               <Button
                 variant="contained"
@@ -499,38 +485,9 @@ export default function App() {
                 disabled={busy || !activeConversationId || !composer.trim()}
                 onClick={handleSendMessage}
               >
-                Send secure message
+                Send
               </Button>
             </Stack>
-          </Stack>
-        </Paper>
-
-        <Paper className="security-panel desktop-only" elevation={0}>
-          <Stack spacing={2.5}>
-            <Box>
-              <Typography variant="h6">Security posture</Typography>
-              <Typography color="text.secondary">
-                The Worker stores metadata in D1, ciphertext blobs in R2, and deletes expired
-                content on cron. Decryption stays in your browser.
-              </Typography>
-            </Box>
-            <Stack spacing={1}>
-              <Chip icon={<LockIcon />} label="X25519 + AES-GCM envelope" />
-              <Chip icon={<ShieldIcon />} label="Opaque R2 ciphertext storage" />
-              <Chip label="Cross-client protocol ready" />
-            </Stack>
-            <Divider />
-            <Box>
-              <Typography variant="subtitle1">Current account</Typography>
-              <Typography>{currentUser?.displayName}</Typography>
-              <Typography color="text.secondary">{currentUser?.email}</Typography>
-            </Box>
-            <Box>
-              <Typography variant="subtitle1">Device key</Typography>
-              <Typography color="text.secondary">
-                {device?.publicKey.slice(0, 24)}...
-              </Typography>
-            </Box>
           </Stack>
         </Paper>
       </Box>
@@ -552,7 +509,7 @@ function SidebarContent(props: {
   return (
     <Stack className="sidebar-content" spacing={2.5}>
       <Box>
-        <Typography variant="h6">Conversations</Typography>
+        <Typography variant="h6">Chats</Typography>
         <List disablePadding>
           {props.conversations.map((conversation) => (
             <ListItemButton
@@ -570,7 +527,7 @@ function SidebarContent(props: {
       </Box>
       <Divider />
       <Stack spacing={1.5}>
-        <Typography variant="h6">Add friend</Typography>
+        <Typography variant="h6">Add</Typography>
         <TextField
           size="small"
           value={props.friendEmail}
@@ -583,23 +540,20 @@ function SidebarContent(props: {
       </Stack>
       <Divider />
       <Box>
-        <Typography variant="h6">Incoming requests</Typography>
+        <Typography variant="h6">Requests</Typography>
         <Stack spacing={1.5} mt={1.5}>
           {props.requests
             .filter((request: any) => request.direction === "incoming" && request.status === "pending")
             .map((request: any) => (
               <Paper key={request.id} variant="outlined" sx={{ p: 1.5 }}>
                 <Typography>{request.counterparty.displayName}</Typography>
-                <Typography color="text.secondary" variant="body2">
-                  {request.counterparty.email}
-                </Typography>
                 <Button sx={{ mt: 1 }} size="small" onClick={() => props.onAcceptRequest(request.id)}>
                   Accept
                 </Button>
               </Paper>
             ))}
           {!props.requests.some((request: any) => request.direction === "incoming" && request.status === "pending") && (
-            <Typography color="text.secondary">No pending requests.</Typography>
+            <Typography color="text.secondary">No requests</Typography>
           )}
         </Stack>
       </Box>
@@ -610,9 +564,6 @@ function SidebarContent(props: {
           {props.friends.map((friend: any) => (
             <Paper key={friend.id} variant="outlined" sx={{ p: 1.5 }}>
               <Typography>{friend.displayName}</Typography>
-              <Typography color="text.secondary" variant="body2">
-                {friend.email}
-              </Typography>
             </Paper>
           ))}
         </Stack>
