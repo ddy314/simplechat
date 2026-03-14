@@ -123,6 +123,7 @@ export default function App() {
   const pendingScrollOffsetRef = useRef<number | null>(null);
   const shouldStickToBottomRef = useRef(true);
   const syncRequestRef = useRef(0);
+  const lastRefreshAtRef = useRef(0);
   const previousMessageStateRef = useRef<{ conversationId: string | null; count: number }>({
     conversationId: null,
     count: 0
@@ -165,12 +166,44 @@ export default function App() {
       return;
     }
 
+    lastRefreshAtRef.current = Date.now();
     void syncWorkspace(activeConversationId);
-    const timer = window.setInterval(() => {
-      void syncWorkspace(activeConversationId);
-    }, 5000);
+  }, [activeConversationId, currentUser, device?.deviceId]);
 
-    return () => window.clearInterval(timer);
+  useEffect(() => {
+    if (!currentUser || !device) {
+      return;
+    }
+
+    const refreshIfNeeded = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastRefreshAtRef.current < 4_000) {
+        return;
+      }
+
+      lastRefreshAtRef.current = now;
+      void syncWorkspace(activeConversationId);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refreshIfNeeded();
+      }
+    };
+
+    window.addEventListener("focus", refreshIfNeeded);
+    window.addEventListener("online", refreshIfNeeded);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener("focus", refreshIfNeeded);
+      window.removeEventListener("online", refreshIfNeeded);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [activeConversationId, currentUser, device?.deviceId]);
 
   useEffect(() => {
