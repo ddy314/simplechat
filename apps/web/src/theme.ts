@@ -3,26 +3,42 @@ import { createTheme } from "@mui/material/styles";
 export const theme = createTheme({
   cssVariables: true,
   shape: {
-    borderRadius: 24
+    borderRadius: 28
   },
   palette: {
     mode: "light",
     primary: {
-      main: "#006a6a"
+      main: "#2f6f67",
+      light: "#d7efe8",
+      dark: "#173a35",
+      contrastText: "#173a35"
     },
     secondary: {
-      main: "#825500"
+      main: "#8c6a2f",
+      light: "#f4e6c8",
+      dark: "#5b4319"
     },
     background: {
-      default: "#f6f3ee",
-      paper: "#fffdf8"
+      default: "#edf2ef",
+      paper: "#fcfdfb"
     },
+    divider: "rgba(24, 45, 41, 0.12)",
     success: {
       main: "#196b2e"
+    },
+    text: {
+      primary: "#16211e",
+      secondary: "#62716c"
     }
   },
   typography: {
-    fontFamily: '"Segoe UI", "Noto Sans SC", sans-serif',
+    fontFamily: '"Segoe UI Variable", "Segoe UI", "Noto Sans SC", sans-serif',
+    body1: {
+      lineHeight: 1.6
+    },
+    body2: {
+      lineHeight: 1.5
+    },
     h4: {
       fontWeight: 700
     },
@@ -40,7 +56,27 @@ export const theme = createTheme({
           backgroundImage: "none"
         }
       }
+    },
+    MuiButton: {
+      styleOverrides: {
+        root: {
+          borderRadius: 18,
+          textTransform: "none",
+          fontWeight: 600
+        }
+      }
+    },
+    MuiChip: {
+      styleOverrides: {
+        root: {
+          borderRadius: 16
+        }
+      }
+    },
+    MuiTextField: {
+      defaultProps: {
+        variant: "outlined"
+      }
     }
   }
 });
-

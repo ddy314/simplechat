@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type UIEvent } from "react";
 import {
   Alert,
-  AppBar,
   Avatar,
+  Badge,
   Box,
   Button,
   Chip,
   CircularProgress,
   Divider,
-  Drawer,
   IconButton,
   List,
   ListItemButton,
@@ -17,13 +16,20 @@ import {
   Stack,
   Switch,
   TextField,
-  Toolbar,
-  Badge,
-  Typography
+  Typography,
+  useMediaQuery
 } from "@mui/material";
-import AddIcon from "@mui/icons-material/Add";
-import LogoutIcon from "@mui/icons-material/Logout";
+import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
+import ForumRoundedIcon from "@mui/icons-material/ForumRounded";
+import LogoutRoundedIcon from "@mui/icons-material/LogoutRounded";
+import MailOutlineRoundedIcon from "@mui/icons-material/MailOutlineRounded";
+import PersonAddRoundedIcon from "@mui/icons-material/PersonAddRounded";
+import SendRoundedIcon from "@mui/icons-material/SendRounded";
+import ShieldRoundedIcon from "@mui/icons-material/ShieldRounded";
+import TimerOutlinedIcon from "@mui/icons-material/TimerOutlined";
+import WhatshotRoundedIcon from "@mui/icons-material/WhatshotRounded";
 import { TTL_PRESETS, type ConversationSummary, type OAuthProviderConfig } from "@simplechat/protocol";
+import { MarkdownMessage } from "./components/MarkdownMessage";
 import { api } from "./lib/api";
 import {
   decryptMessage,
@@ -32,7 +38,6 @@ import {
   type DecryptedMessage,
   type DeviceIdentity
 } from "./lib/crypto";
-import { MarkdownMessage } from "./components/MarkdownMessage";
 
 type SessionState =
   | { loading: true }
@@ -47,15 +52,28 @@ type SessionState =
       };
     };
 
+type User = {
+  id: string;
+  email: string;
+  displayName: string;
+  avatarUrl: string | null;
+};
+
 type ConversationMeta = {
   preview: string;
   unreadCount: number;
   lastMessageAt: string | null;
 };
 
+type SidebarSection = "chats" | "people" | "requests";
+
 const SEEN_STORAGE_KEY = "simplechat_seen_map";
+const INITIAL_VISIBLE_MESSAGES = 80;
+const MESSAGE_PAGE_SIZE = 80;
+const AUTO_SCROLL_THRESHOLD = 96;
 
 export default function App() {
+  const isMobile = useMediaQuery("(max-width:900px)");
   const [providers, setProviders] = useState<OAuthProviderConfig[]>([]);
   const [session, setSession] = useState<SessionState>({ loading: true });
   const [device, setDevice] = useState<DeviceIdentity | null>(null);
@@ -70,7 +88,6 @@ export default function App() {
   const [selectedTtl, setSelectedTtl] = useState(TTL_PRESETS[1].value);
   const [burnAfterRead, setBurnAfterRead] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authEmail, setAuthEmail] = useState("");
@@ -78,7 +95,17 @@ export default function App() {
   const [authDisplayName, setAuthDisplayName] = useState("");
   const [conversationMeta, setConversationMeta] = useState<Record<string, ConversationMeta>>({});
   const [seenMap, setSeenMap] = useState<Record<string, string>>(() => loadSeenMap());
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection>("chats");
+  const [visibleMessageCount, setVisibleMessageCount] = useState(INITIAL_VISIBLE_MESSAGES);
+  const [showNewMessageNotice, setShowNewMessageNotice] = useState(false);
   const readMarksRef = useRef(new Set<string>());
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const pendingScrollOffsetRef = useRef<number | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const previousMessageStateRef = useRef<{ conversationId: string | null; count: number }>({
+    conversationId: null,
+    count: 0
+  });
   const currentUser = !session.loading ? session.user : null;
 
   const activeConversation = useMemo(
@@ -86,6 +113,19 @@ export default function App() {
     [activeConversationId, conversations]
   );
   const oauthProviders = providers.filter((provider) => provider.id !== "local" && provider.enabled);
+  const incomingRequests = useMemo(
+    () =>
+      requests.filter(
+        (request: any) => request.direction === "incoming" && request.status === "pending"
+      ),
+    [requests]
+  );
+  const displayedMessages = useMemo(
+    () => messages.slice(-visibleMessageCount),
+    [messages, visibleMessageCount]
+  );
+  const hasOlderMessages = displayedMessages.length < messages.length;
+  const selectedTtlPreset = TTL_PRESETS.find((preset) => preset.value === selectedTtl) ?? TTL_PRESETS[0];
 
   useEffect(() => {
     void bootstrap();
@@ -95,7 +135,7 @@ export default function App() {
     if (!session.loading && currentUser) {
       void hydrateAuthenticatedState();
     }
-  }, [currentUser, session.loading]);
+  }, [currentUser, isMobile, session.loading]);
 
   useEffect(() => {
     if (!currentUser || !device) {
@@ -109,6 +149,93 @@ export default function App() {
 
     return () => window.clearInterval(timer);
   }, [activeConversationId, currentUser, device?.deviceId]);
+
+  useEffect(() => {
+    if (isMobile) {
+      return;
+    }
+
+    if (!activeConversationId && conversations.length > 0) {
+      setActiveConversationId(conversations[0].id);
+    }
+  }, [activeConversationId, conversations, isMobile]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      setConversationDetail(null);
+      setMessages([]);
+      setShowNewMessageNotice(false);
+      return;
+    }
+
+    setVisibleMessageCount(INITIAL_VISIBLE_MESSAGES);
+    setShowNewMessageNotice(false);
+    shouldStickToBottomRef.current = true;
+  }, [activeConversationId]);
+
+  useEffect(() => {
+    if (!activeConversationId) {
+      return;
+    }
+
+    if (conversations.some((conversation) => conversation.id === activeConversationId)) {
+      return;
+    }
+
+    setActiveConversationId(isMobile ? null : conversations[0]?.id ?? null);
+  }, [activeConversationId, conversations, isMobile]);
+
+  useEffect(() => {
+    const list = messageListRef.current;
+    if (!list || pendingScrollOffsetRef.current === null) {
+      return;
+    }
+
+    const previousOffset = pendingScrollOffsetRef.current;
+    pendingScrollOffsetRef.current = null;
+
+    window.requestAnimationFrame(() => {
+      list.scrollTop = list.scrollHeight - previousOffset;
+    });
+  }, [displayedMessages.length]);
+
+  useEffect(() => {
+    const list = messageListRef.current;
+    if (!list) {
+      previousMessageStateRef.current = {
+        conversationId: activeConversationId,
+        count: messages.length
+      };
+      return;
+    }
+
+    const previousState = previousMessageStateRef.current;
+    const conversationChanged = previousState.conversationId !== activeConversationId;
+    const countIncreased = messages.length > previousState.count;
+    const latestMessage = messages.at(-1);
+    const latestOutgoing = latestMessage?.senderUserId === currentUser?.id;
+
+    if (conversationChanged) {
+      window.requestAnimationFrame(() => {
+        list.scrollTo({ top: list.scrollHeight, behavior: "auto" });
+      });
+      setShowNewMessageNotice(false);
+    } else if (countIncreased) {
+      if (shouldStickToBottomRef.current || latestOutgoing) {
+        window.requestAnimationFrame(() => {
+          list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
+        });
+        setShowNewMessageNotice(false);
+      } else {
+        setShowNewMessageNotice(true);
+      }
+    }
+
+    previousMessageStateRef.current = {
+      conversationId: activeConversationId,
+      count: messages.length
+    };
+  }, [activeConversationId, currentUser?.id, messages]);
 
   async function bootstrap() {
     try {
@@ -145,7 +272,13 @@ export default function App() {
       setFriends(friendsResponse.friends);
       setRequests(requestsResponse.requests);
       setConversations(conversationsResponse.conversations);
-      setActiveConversationId((current) => current ?? conversationsResponse.conversations[0]?.id ?? null);
+      setActiveConversationId((current) => {
+        if (current && conversationsResponse.conversations.some((conversation) => conversation.id === current)) {
+          return current;
+        }
+
+        return isMobile ? null : conversationsResponse.conversations[0]?.id ?? null;
+      });
       await syncConversationMeta(
         conversationsResponse.conversations,
         identity,
@@ -305,6 +438,7 @@ export default function App() {
     try {
       await api.createFriendRequest(friendEmail.trim());
       setFriendEmail("");
+      setSidebarSection("requests");
       const requestsResponse = await api.getFriendRequests();
       setRequests(requestsResponse.requests);
     } catch (error) {
@@ -330,6 +464,51 @@ export default function App() {
     await api.logout();
     window.localStorage.removeItem(SEEN_STORAGE_KEY);
     window.location.reload();
+  }
+
+  function handleSelectConversation(id: string) {
+    setActiveConversationId(id);
+    setConversationDetail(null);
+    setMessages([]);
+    setShowNewMessageNotice(false);
+    setSidebarSection("chats");
+  }
+
+  function handleBackToList() {
+    setActiveConversationId(null);
+    setSidebarSection("chats");
+  }
+
+  function handleMessageListScroll(event: UIEvent<HTMLDivElement>) {
+    const node = event.currentTarget;
+    const nearBottom =
+      node.scrollHeight - node.scrollTop - node.clientHeight <= AUTO_SCROLL_THRESHOLD;
+
+    shouldStickToBottomRef.current = nearBottom;
+
+    if (nearBottom) {
+      setShowNewMessageNotice(false);
+    }
+  }
+
+  function handleLoadOlderMessages() {
+    const list = messageListRef.current;
+    if (list) {
+      pendingScrollOffsetRef.current = list.scrollHeight - list.scrollTop;
+    }
+
+    setVisibleMessageCount((previous) => Math.min(previous + MESSAGE_PAGE_SIZE, messages.length));
+  }
+
+  function scrollToLatest() {
+    const list = messageListRef.current;
+    if (!list) {
+      return;
+    }
+
+    shouldStickToBottomRef.current = true;
+    setShowNewMessageNotice(false);
+    list.scrollTo({ top: list.scrollHeight, behavior: "smooth" });
   }
 
   function markConversationSeen(conversationId: string, visible: DecryptedMessage[]) {
@@ -390,9 +569,14 @@ export default function App() {
                 {notice}
               </Alert>
             )}
-            <Stack spacing={0.5}>
+            <Stack spacing={0.75}>
+              <Typography variant="overline" color="primary.main">
+                Encrypted direct messaging
+              </Typography>
               <Typography variant="h4">SimpleChat</Typography>
-              <Typography color="text.secondary">Login or create an account</Typography>
+              <Typography color="text.secondary">
+                一个更像桌面聊天应用的安全会话空间，而不是普通网页表单。
+              </Typography>
             </Stack>
             <Stack spacing={1.5}>
               <Stack direction="row" spacing={1}>
@@ -456,165 +640,210 @@ export default function App() {
 
   return (
     <Box className="app-shell">
-      <AppBar position="static" color="transparent" elevation={0}>
-        <Toolbar className="topbar">
-          <Stack direction="row" spacing={1.5} alignItems="center">
-            <IconButton onClick={() => setSidebarOpen(true)} className="mobile-only">
-              <AddIcon />
-            </IconButton>
-            <Typography variant="h5">SimpleChat</Typography>
-          </Stack>
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Typography color="text.secondary" variant="body2">
-              {currentUser?.displayName}
-            </Typography>
-            <Button startIcon={<LogoutIcon />} onClick={handleLogout}>
-              Sign out
-            </Button>
-          </Stack>
-        </Toolbar>
-      </AppBar>
-
       {notice && (
-        <Alert severity="info" onClose={() => setNotice(null)} sx={{ mx: 3 }}>
+        <Alert severity="info" onClose={() => setNotice(null)} className="notice-banner">
           {notice}
         </Alert>
       )}
 
-      <Box className="workspace">
-        <Drawer
-          open={sidebarOpen}
-          onClose={() => setSidebarOpen(false)}
-          className="mobile-only"
-          PaperProps={{ className: "drawer-paper" }}
-        >
-          <SidebarContent
-            conversations={conversations}
-            conversationMeta={conversationMeta}
-            activeConversationId={activeConversationId}
-            onSelectConversation={(id) => {
-              setActiveConversationId(id);
-              setSidebarOpen(false);
-            }}
-            friends={friends}
-            requests={requests}
-            friendEmail={friendEmail}
-            setFriendEmail={setFriendEmail}
-            onAddFriend={handleAddFriend}
-            onAcceptRequest={handleAcceptRequest}
-          />
-        </Drawer>
+      <Box className={`workspace ${isMobile ? "workspace-mobile" : ""}`}>
+        {(!isMobile || !activeConversationId) && (
+          <Paper className="sidebar-panel" elevation={0}>
+            <SidebarContent
+              currentUser={currentUser}
+              conversations={conversations}
+              conversationMeta={conversationMeta}
+              activeConversationId={activeConversationId}
+              onSelectConversation={handleSelectConversation}
+              friends={friends}
+              requests={incomingRequests}
+              friendEmail={friendEmail}
+              setFriendEmail={setFriendEmail}
+              onAddFriend={handleAddFriend}
+              onAcceptRequest={handleAcceptRequest}
+              onLogout={handleLogout}
+              sidebarSection={sidebarSection}
+              setSidebarSection={setSidebarSection}
+            />
+          </Paper>
+        )}
 
-        <Paper className="sidebar desktop-only" elevation={0}>
-          <SidebarContent
-            conversations={conversations}
-            conversationMeta={conversationMeta}
-            activeConversationId={activeConversationId}
-            onSelectConversation={setActiveConversationId}
-            friends={friends}
-            requests={requests}
-            friendEmail={friendEmail}
-            setFriendEmail={setFriendEmail}
-            onAddFriend={handleAddFriend}
-            onAcceptRequest={handleAcceptRequest}
-          />
-        </Paper>
+        {(!isMobile || activeConversationId) && (
+          <Paper className="chat-panel" elevation={0}>
+            <Stack className="chat-header" direction="row" alignItems="center" spacing={2}>
+              {isMobile && (
+                <IconButton onClick={handleBackToList} edge="start" aria-label="Back to chats">
+                  <ArrowBackRoundedIcon />
+                </IconButton>
+              )}
+              <Avatar src={activeConversation?.counterpart?.avatarUrl ?? undefined}>
+                {getInitial(activeConversation?.counterpart?.displayName)}
+              </Avatar>
+              <Box className="chat-header-copy">
+                <Typography variant="h6">
+                  {activeConversation?.counterpart?.displayName ?? "Select a conversation"}
+                </Typography>
+                <Typography color="text.secondary">
+                  {activeConversation?.counterpart?.email ?? "Pick a secure thread to start talking."}
+                </Typography>
+              </Box>
+              {!isMobile && (
+                <Chip
+                  icon={<ShieldRoundedIcon />}
+                  label="End-to-end encrypted"
+                  color="primary"
+                  variant="outlined"
+                  className="chat-status-chip"
+                />
+              )}
+            </Stack>
 
-        <Paper className="chat-panel" elevation={0}>
-          <Stack className="chat-header" direction="row" alignItems="center" spacing={2}>
-            <Avatar src={activeConversation?.counterpart?.avatarUrl ?? undefined}>
-              {activeConversation?.counterpart?.displayName?.[0] ?? "?"}
-            </Avatar>
-            <Box>
-              <Typography variant="h6">
-                {activeConversation?.counterpart?.displayName ?? "Select a conversation"}
-              </Typography>
-              <Typography color="text.secondary">
-                {activeConversation?.counterpart?.email ?? "No active chat"}
-              </Typography>
-            </Box>
-          </Stack>
-          <Divider />
+            <Box
+              ref={messageListRef}
+              className={`message-list ${!displayedMessages.length ? "message-list-empty" : ""}`}
+              onScroll={handleMessageListScroll}
+            >
+              {hasOlderMessages && (
+                <Box className="message-list-top">
+                  <Button variant="text" size="small" onClick={handleLoadOlderMessages}>
+                    Load earlier messages
+                  </Button>
+                </Box>
+              )}
 
-          <Stack className="message-list" spacing={2}>
-            {messages.map((message) => {
-              const outgoing = message.senderUserId === currentUser?.id;
-              return (
-                <Stack
-                  key={message.id}
-                  direction="row"
-                  justifyContent={outgoing ? "flex-end" : "flex-start"}
-                >
-                  <Stack spacing={0.75} alignItems={outgoing ? "flex-end" : "flex-start"}>
-                    <Typography variant="caption" color="text.secondary">
-                      {message.senderDisplayName} · {new Date(message.createdAt).toLocaleString()}
-                    </Typography>
-                    <MarkdownMessage markdown={message.markdown} outgoing={outgoing} />
-                    {message.burnAfterRead && (
-                      <Chip size="small" color="warning" label="Burn after read" />
+              {displayedMessages.map((message) => {
+                const outgoing = message.senderUserId === currentUser?.id;
+
+                return (
+                  <Stack
+                    key={message.id}
+                    direction="row"
+                    spacing={1.5}
+                    justifyContent={outgoing ? "flex-end" : "flex-start"}
+                    className={`message-row ${outgoing ? "message-row-outgoing" : "message-row-incoming"}`}
+                  >
+                    {!outgoing && (
+                      <Avatar
+                        src={message.senderAvatarUrl ?? undefined}
+                        className="message-avatar"
+                      >
+                        {getInitial(message.senderDisplayName)}
+                      </Avatar>
                     )}
+                    <Stack
+                      spacing={0.75}
+                      alignItems={outgoing ? "flex-end" : "flex-start"}
+                      className="message-content"
+                    >
+                      <Typography variant="caption" color="text.secondary" className="message-meta">
+                        {message.senderDisplayName} · {formatDateTime(message.createdAt)}
+                      </Typography>
+                      <MarkdownMessage markdown={message.markdown} outgoing={outgoing} />
+                      {message.burnAfterRead && (
+                        <Chip
+                          size="small"
+                          color="warning"
+                          variant="outlined"
+                          label="Burn after read"
+                        />
+                      )}
+                    </Stack>
                   </Stack>
-                </Stack>
-              );
-            })}
-            {!messages.length && (
-              <Box className="empty-state">
-                <Typography variant="h6">No messages</Typography>
+                );
+              })}
+
+              {!displayedMessages.length && (
+                <Box className="empty-state empty-state-chat">
+                  <Typography variant="h6">No messages yet</Typography>
+                  <Typography color="text.secondary">
+                    发送第一条消息后，这里会保持一个更接近原生聊天应用的时间线视图。
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+
+            {showNewMessageNotice && (
+              <Box className="new-message-notice">
+                <Button variant="contained" size="small" onClick={scrollToLatest}>
+                  Jump to latest
+                </Button>
               </Box>
             )}
-          </Stack>
 
-          <Divider />
-
-          <Stack className="composer-panel" spacing={1.5}>
-            <Stack direction="row" spacing={1.5} alignItems="flex-end">
-              <TextField
-                fullWidth
-                multiline
-                maxRows={4}
-                value={composer}
-                onChange={(event) => setComposer(event.target.value)}
-                onKeyDown={handleComposerKeyDown}
-                placeholder="Message"
-              />
-              <Button
-                variant="contained"
-                sx={{ minWidth: 96, height: 56 }}
-                endIcon={busy ? <CircularProgress size={16} color="inherit" /> : <AddIcon />}
-                disabled={busy || !activeConversationId || !composer.trim()}
-                onClick={handleSendMessage}
-              >
-                Send
-              </Button>
-            </Stack>
-            <Stack direction="row" justifyContent="space-between" alignItems="center" flexWrap="wrap">
-              <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                {TTL_PRESETS.map((preset) => (
-                  <Chip
-                    key={preset.value}
-                    size="small"
-                    label={preset.label}
-                    clickable
-                    color={selectedTtl === preset.value ? "primary" : "default"}
-                    onClick={() => setSelectedTtl(preset.value)}
+            <Stack className="composer-panel" spacing={1.5}>
+              <Stack direction="row" spacing={1.5} alignItems="flex-end">
+                <TextField
+                  fullWidth
+                  multiline
+                  maxRows={6}
+                  value={composer}
+                  onChange={(event) => setComposer(event.target.value)}
+                  onKeyDown={handleComposerKeyDown}
+                  placeholder={activeConversationId ? "Write a secure message" : "Select a conversation first"}
+                />
+                <Button
+                  variant="contained"
+                  className="send-button"
+                  endIcon={
+                    busy ? <CircularProgress size={16} color="inherit" /> : <SendRoundedIcon />
+                  }
+                  disabled={busy || !activeConversationId || !composer.trim()}
+                  onClick={handleSendMessage}
+                >
+                  Send
+                </Button>
+              </Stack>
+              <Stack className="composer-meta" direction="row" justifyContent="space-between" gap={1.5}>
+                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                  {TTL_PRESETS.map((preset) => (
+                    <Chip
+                      key={preset.value}
+                      size="small"
+                      label={preset.label}
+                      clickable
+                      color={selectedTtl === preset.value ? "primary" : "default"}
+                      variant={selectedTtl === preset.value ? "filled" : "outlined"}
+                      onClick={() => setSelectedTtl(preset.value)}
+                    />
+                  ))}
+                </Stack>
+                <Stack direction="row" alignItems="center" spacing={1}>
+                  <Typography color="text.secondary" variant="body2">
+                    {burnAfterRead ? "Burn after read" : `Auto delete ${selectedTtlPreset.label}`}
+                  </Typography>
+                  <Switch
+                    checked={burnAfterRead}
+                    onChange={(event) => setBurnAfterRead(event.target.checked)}
                   />
-                ))}
-              </Stack>
-              <Stack direction="row" alignItems="center" spacing={1}>
-                <Typography color="text.secondary" variant="body2">
-                  {burnAfterRead ? "Burn after read" : `Auto delete ${Math.round(selectedTtl / 60)}m`}
-                </Typography>
-                <Switch checked={burnAfterRead} onChange={(event) => setBurnAfterRead(event.target.checked)} />
+                </Stack>
               </Stack>
             </Stack>
-          </Stack>
-        </Paper>
+          </Paper>
+        )}
+
+        {!isMobile && (
+          <Paper className="detail-panel" elevation={0}>
+            <ConversationDetailRail
+              currentUser={currentUser}
+              activeConversation={activeConversation}
+              activeConversationMeta={
+                activeConversationId ? conversationMeta[activeConversationId] ?? null : null
+              }
+              incomingRequestCount={incomingRequests.length}
+              selectedTtlLabel={selectedTtlPreset.label}
+              burnAfterRead={burnAfterRead}
+              messageCount={messages.length}
+              deviceLabel={device?.label ?? "This device"}
+            />
+          </Paper>
+        )}
       </Box>
     </Box>
   );
 }
 
 function SidebarContent(props: {
+  currentUser: User | null;
   conversations: ConversationSummary[];
   conversationMeta: Record<string, ConversationMeta>;
   activeConversationId: string | null;
@@ -625,90 +854,315 @@ function SidebarContent(props: {
   setFriendEmail: (value: string) => void;
   onAddFriend: () => void;
   onAcceptRequest: (requestId: string) => void;
+  onLogout: () => void;
+  sidebarSection: SidebarSection;
+  setSidebarSection: (value: SidebarSection) => void;
 }) {
-  const contacts = [
-    ...props.conversations.map((conversation) => ({
-      key: `conversation:${conversation.id}`,
-      id: conversation.id,
-      name: conversation.counterpart?.displayName ?? "Direct conversation",
-      secondary:
-        props.conversationMeta[conversation.id]?.preview ||
-        conversation.counterpart?.email ||
-        "Encrypted channel",
-      unreadCount: props.conversationMeta[conversation.id]?.unreadCount ?? 0,
-      selectable: true
-    })),
-    ...props.friends
-      .filter((friend: any) => !friend.conversationId)
-      .map((friend: any) => ({
-        key: `friend:${friend.id}`,
-        id: friend.conversationId,
-        name: friend.displayName,
-        secondary: friend.email,
-        unreadCount: 0,
-        selectable: false
-      }))
-  ];
+  const friendsWithoutConversation = props.friends.filter((friend: any) => !friend.conversationId);
 
   return (
     <Stack className="sidebar-content" spacing={2.5}>
-      <Box>
-        <Typography variant="h6">Contacts</Typography>
-        <List disablePadding>
-          {contacts.map((contact) => (
-            <ListItemButton
-              key={contact.key}
-              selected={props.activeConversationId === contact.id}
-              disabled={!contact.selectable}
-              onClick={() => contact.id && props.onSelectConversation(contact.id)}
-            >
-              <ListItemText
-                primary={
-                  <Stack direction="row" alignItems="center" justifyContent="space-between">
-                    <Typography variant="body2">{contact.name}</Typography>
-                    {contact.unreadCount > 0 && (
-                      <Badge color="primary" badgeContent={contact.unreadCount} />
-                    )}
-                  </Stack>
-                }
-                secondary={contact.secondary}
-              />
-            </ListItemButton>
-          ))}
-        </List>
-      </Box>
-      <Divider />
-      <Stack spacing={1.5}>
-        <Typography variant="h6">Add</Typography>
-        <TextField
-          size="small"
-          value={props.friendEmail}
-          onChange={(event) => props.setFriendEmail(event.target.value)}
-          placeholder="friend@example.com"
-        />
-        <Button variant="contained" onClick={props.onAddFriend}>
-          Send request
-        </Button>
+      <Stack spacing={2}>
+        <Stack direction="row" spacing={1.5} alignItems="center">
+          <Avatar src={props.currentUser?.avatarUrl ?? undefined}>
+            {getInitial(props.currentUser?.displayName)}
+          </Avatar>
+          <Box flex={1} minWidth={0}>
+            <Typography variant="subtitle1" noWrap>
+              {props.currentUser?.displayName}
+            </Typography>
+            <Typography variant="body2" color="text.secondary" noWrap>
+              {props.currentUser?.email}
+            </Typography>
+          </Box>
+          <IconButton onClick={props.onLogout} aria-label="Sign out">
+            <LogoutRoundedIcon />
+          </IconButton>
+        </Stack>
+
+        <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+          <Chip
+            icon={<ForumRoundedIcon />}
+            label="Chats"
+            clickable
+            color={props.sidebarSection === "chats" ? "primary" : "default"}
+            variant={props.sidebarSection === "chats" ? "filled" : "outlined"}
+            onClick={() => props.setSidebarSection("chats")}
+          />
+          <Chip
+            icon={<PersonAddRoundedIcon />}
+            label="People"
+            clickable
+            color={props.sidebarSection === "people" ? "primary" : "default"}
+            variant={props.sidebarSection === "people" ? "filled" : "outlined"}
+            onClick={() => props.setSidebarSection("people")}
+          />
+          <Chip
+            icon={<MailOutlineRoundedIcon />}
+            label={`Requests ${props.requests.length > 0 ? props.requests.length : ""}`.trim()}
+            clickable
+            color={props.sidebarSection === "requests" ? "primary" : "default"}
+            variant={props.sidebarSection === "requests" ? "filled" : "outlined"}
+            onClick={() => props.setSidebarSection("requests")}
+          />
+        </Stack>
       </Stack>
+
       <Divider />
-      <Box>
-        <Typography variant="h6">Requests</Typography>
-        <Stack spacing={1.5} mt={1.5}>
-          {props.requests
-            .filter((request: any) => request.direction === "incoming" && request.status === "pending")
-            .map((request: any) => (
-              <Paper key={request.id} variant="outlined" sx={{ p: 1.5 }}>
-                <Typography>{request.counterparty.displayName}</Typography>
-                <Button sx={{ mt: 1 }} size="small" onClick={() => props.onAcceptRequest(request.id)}>
-                  Accept
-                </Button>
+
+      {props.sidebarSection === "chats" && (
+        <Stack spacing={1.5} minHeight={0}>
+          <Box>
+            <Typography variant="overline" color="text.secondary">
+              Conversations
+            </Typography>
+            <Typography variant="h6">Recent secure threads</Typography>
+          </Box>
+          <List disablePadding className="conversation-list">
+            {props.conversations.map((conversation) => {
+              const meta = props.conversationMeta[conversation.id];
+              return (
+                <ListItemButton
+                  key={conversation.id}
+                  selected={props.activeConversationId === conversation.id}
+                  onClick={() => props.onSelectConversation(conversation.id)}
+                  className="conversation-item"
+                >
+                  <Avatar src={conversation.counterpart?.avatarUrl ?? undefined}>
+                    {getInitial(conversation.counterpart?.displayName)}
+                  </Avatar>
+                  <ListItemText
+                    disableTypography
+                    primary={
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                        <Typography variant="body2" fontWeight={600} noWrap>
+                          {conversation.counterpart?.displayName ?? "Direct conversation"}
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary">
+                          {formatConversationTime(meta?.lastMessageAt)}
+                        </Typography>
+                      </Stack>
+                    }
+                    secondary={
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" gap={1}>
+                        <Typography variant="body2" color="text.secondary" noWrap>
+                          {meta?.preview || conversation.counterpart?.email || "Encrypted channel"}
+                        </Typography>
+                        {meta?.unreadCount ? (
+                          <Badge color="primary" badgeContent={meta.unreadCount} />
+                        ) : null}
+                      </Stack>
+                    }
+                  />
+                </ListItemButton>
+              );
+            })}
+            {props.conversations.length === 0 && (
+              <Box className="empty-state empty-state-sidebar">
+                <Typography variant="body1">No conversations yet</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Add a person first, then start an encrypted thread.
+                </Typography>
+              </Box>
+            )}
+          </List>
+        </Stack>
+      )}
+
+      {props.sidebarSection === "people" && (
+        <Stack spacing={2}>
+          <Box>
+            <Typography variant="overline" color="text.secondary">
+              People
+            </Typography>
+            <Typography variant="h6">Add or revisit contacts</Typography>
+          </Box>
+          <Paper variant="outlined" className="sidebar-card">
+            <Stack spacing={1.25}>
+              <Typography variant="subtitle2">Add a friend</Typography>
+              <TextField
+                size="small"
+                value={props.friendEmail}
+                onChange={(event) => props.setFriendEmail(event.target.value)}
+                placeholder="friend@example.com"
+              />
+              <Button variant="contained" onClick={props.onAddFriend}>
+                Send request
+              </Button>
+            </Stack>
+          </Paper>
+          <Stack spacing={1.25}>
+            {props.friends.map((friend: any) => (
+              <Paper key={friend.id} variant="outlined" className="sidebar-card">
+                <Stack direction="row" alignItems="center" justifyContent="space-between" gap={1.5}>
+                  <Box minWidth={0}>
+                    <Typography variant="subtitle2" noWrap>
+                      {friend.displayName}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {friend.email}
+                    </Typography>
+                  </Box>
+                  {friend.conversationId ? (
+                    <Button size="small" onClick={() => props.onSelectConversation(friend.conversationId)}>
+                      Open chat
+                    </Button>
+                  ) : (
+                    <Chip size="small" label="Connected" variant="outlined" />
+                  )}
+                </Stack>
               </Paper>
             ))}
-          {!props.requests.some((request: any) => request.direction === "incoming" && request.status === "pending") && (
-            <Typography color="text.secondary">No requests</Typography>
-          )}
+            {props.friends.length === 0 && (
+              <Typography color="text.secondary">
+                Your contact book is empty for now.
+              </Typography>
+            )}
+            {friendsWithoutConversation.length > 0 && (
+              <Typography variant="caption" color="text.secondary">
+                These contacts are added but have not started a conversation yet.
+              </Typography>
+            )}
+          </Stack>
         </Stack>
-      </Box>
+      )}
+
+      {props.sidebarSection === "requests" && (
+        <Stack spacing={2}>
+          <Box>
+            <Typography variant="overline" color="text.secondary">
+              Requests
+            </Typography>
+            <Typography variant="h6">Pending approvals</Typography>
+          </Box>
+          <Stack spacing={1.25}>
+            {props.requests.map((request: any) => (
+              <Paper key={request.id} variant="outlined" className="sidebar-card">
+                <Stack spacing={1}>
+                  <Box>
+                    <Typography variant="subtitle2">{request.counterparty.displayName}</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                      {request.counterparty.email}
+                    </Typography>
+                  </Box>
+                  <Button size="small" variant="contained" onClick={() => props.onAcceptRequest(request.id)}>
+                    Accept
+                  </Button>
+                </Stack>
+              </Paper>
+            ))}
+            {props.requests.length === 0 && (
+              <Box className="empty-state empty-state-sidebar">
+                <Typography variant="body1">No pending requests</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  Incoming friend requests will appear here instead of competing with the chat list.
+                </Typography>
+              </Box>
+            )}
+          </Stack>
+        </Stack>
+      )}
+    </Stack>
+  );
+}
+
+function ConversationDetailRail(props: {
+  currentUser: User | null;
+  activeConversation: ConversationSummary | null;
+  activeConversationMeta: ConversationMeta | null;
+  incomingRequestCount: number;
+  selectedTtlLabel: string;
+  burnAfterRead: boolean;
+  messageCount: number;
+  deviceLabel: string;
+}) {
+  return (
+    <Stack className="detail-content" spacing={2.5}>
+      <Stack spacing={1}>
+        <Typography variant="overline" color="text.secondary">
+          Workspace
+        </Typography>
+        <Typography variant="h6">Conversation details</Typography>
+      </Stack>
+
+      {props.activeConversation ? (
+        <Paper variant="outlined" className="detail-card">
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={1.5} alignItems="center">
+              <Avatar src={props.activeConversation.counterpart?.avatarUrl ?? undefined}>
+                {getInitial(props.activeConversation.counterpart?.displayName)}
+              </Avatar>
+              <Box minWidth={0}>
+                <Typography variant="subtitle1" noWrap>
+                  {props.activeConversation.counterpart?.displayName ?? "Direct conversation"}
+                </Typography>
+                <Typography variant="body2" color="text.secondary" noWrap>
+                  {props.activeConversation.counterpart?.email}
+                </Typography>
+              </Box>
+            </Stack>
+            <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+              <Chip icon={<ShieldRoundedIcon />} label="Encrypted" variant="outlined" />
+              <Chip icon={<TimerOutlinedIcon />} label={`TTL ${props.selectedTtlLabel}`} variant="outlined" />
+              {props.burnAfterRead && (
+                <Chip icon={<WhatshotRoundedIcon />} label="Burn after read" color="warning" variant="outlined" />
+              )}
+            </Stack>
+          </Stack>
+        </Paper>
+      ) : (
+        <Paper variant="outlined" className="detail-card">
+          <Stack spacing={1}>
+            <Typography variant="subtitle2">No active thread</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Select a conversation to show participant details, message policy, and thread context.
+            </Typography>
+          </Stack>
+        </Paper>
+      )}
+
+      <Paper variant="outlined" className="detail-card">
+        <Stack spacing={1.5}>
+          <Typography variant="subtitle2">Current session</Typography>
+          <DetailMetric label="Signed in as" value={props.currentUser?.displayName ?? "Unknown"} />
+          <DetailMetric label="Device label" value={props.deviceLabel} />
+          <DetailMetric label="Visible messages" value={String(props.messageCount)} />
+          <DetailMetric label="Unread requests" value={String(props.incomingRequestCount)} />
+        </Stack>
+      </Paper>
+
+      <Paper variant="outlined" className="detail-card">
+        <Stack spacing={1.5}>
+          <Typography variant="subtitle2">Thread snapshot</Typography>
+          <DetailMetric
+            label="Latest preview"
+            value={props.activeConversationMeta?.preview || "No messages yet"}
+          />
+          <DetailMetric
+            label="Unread in thread"
+            value={String(props.activeConversationMeta?.unreadCount ?? 0)}
+          />
+          <DetailMetric
+            label="Last activity"
+            value={
+              props.activeConversationMeta?.lastMessageAt
+                ? formatDateTime(props.activeConversationMeta.lastMessageAt)
+                : "Not available"
+            }
+          />
+        </Stack>
+      </Paper>
+    </Stack>
+  );
+}
+
+function DetailMetric(props: { label: string; value: string }) {
+  return (
+    <Stack spacing={0.35}>
+      <Typography variant="caption" color="text.secondary">
+        {props.label}
+      </Typography>
+      <Typography variant="body2">{props.value}</Typography>
     </Stack>
   );
 }
@@ -737,5 +1191,32 @@ function saveSeenMap(seenMap: Record<string, string>) {
 }
 
 function toPreview(markdown: string): string {
-  return markdown.replace(/[#*_`>\-\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 36) || "New message";
+  return markdown.replace(/[#*_`>\-\n]/g, " ").replace(/\s+/g, " ").trim().slice(0, 54) || "New message";
+}
+
+function getInitial(value: string | null | undefined) {
+  return value?.trim().slice(0, 1).toUpperCase() || "?";
+}
+
+function formatConversationTime(value: string | null | undefined) {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(value);
+  const now = new Date();
+  const sameDay = date.toDateString() === now.toDateString();
+
+  return sameDay
+    ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
 }
