@@ -10,8 +10,8 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "simplechat-db",
-      "database_id": "208abf08-5560-43c1-be10-a82820944163"
+      "database_name": "simplechat-db-apac",
+      "database_id": "8e9255ac-362b-411d-bda5-6a7682d338d9"
     }
   ],
   "r2_buckets": [

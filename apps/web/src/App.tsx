@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   Alert,
   AppBar,
@@ -238,6 +238,7 @@ export default function App() {
 
     setBusy(true);
     try {
+      const markdown = composer.trim();
       const recipients = conversationDetail.participantDevices.map((item: any) => ({
         deviceId: item.deviceId,
         publicKey: item.publicKey
@@ -245,18 +246,53 @@ export default function App() {
       const envelope = await encryptMarkdownMessage({
         conversationId: activeConversationId,
         senderDeviceId: device.deviceId,
-        markdown: composer.trim(),
+        markdown,
         burnAfterRead,
         ttlSeconds: selectedTtl,
         recipients
       });
       await api.sendMessage(activeConversationId, envelope);
       setComposer("");
-      await syncWorkspace(activeConversationId);
+      const optimisticMessage: DecryptedMessage = {
+        id: envelope.messageId,
+        senderUserId: currentUser?.id ?? "",
+        senderDisplayName: currentUser?.displayName ?? "You",
+        senderAvatarUrl: currentUser?.avatarUrl ?? null,
+        createdAt: envelope.createdAt,
+        expiresAt: envelope.expiresAt,
+        burnAfterRead,
+        envelope,
+        markdown
+      };
+      setMessages((previous) => {
+        const next = [...previous.filter((item) => item.id !== optimisticMessage.id), optimisticMessage];
+        markConversationSeen(activeConversationId, next);
+        return next;
+      });
+      setConversationMeta((previous) => ({
+        ...previous,
+        [activeConversationId]: {
+          preview: toPreview(markdown),
+          unreadCount: 0,
+          lastMessageAt: envelope.createdAt
+        }
+      }));
+      void syncWorkspace(activeConversationId);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to send message.");
     } finally {
       setBusy(false);
+    }
+  }
+
+  function handleComposerKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+    if (!busy) {
+      void handleSendMessage();
     }
   }
 
@@ -536,6 +572,7 @@ export default function App() {
               multiline
               value={composer}
               onChange={(event) => setComposer(event.target.value)}
+              onKeyDown={handleComposerKeyDown}
               placeholder="Message"
             />
             <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
@@ -585,36 +622,52 @@ function SidebarContent(props: {
   onAddFriend: () => void;
   onAcceptRequest: (requestId: string) => void;
 }) {
+  const contacts = [
+    ...props.conversations.map((conversation) => ({
+      key: `conversation:${conversation.id}`,
+      id: conversation.id,
+      name: conversation.counterpart?.displayName ?? "Direct conversation",
+      secondary:
+        props.conversationMeta[conversation.id]?.preview ||
+        conversation.counterpart?.email ||
+        "Encrypted channel",
+      unreadCount: props.conversationMeta[conversation.id]?.unreadCount ?? 0,
+      selectable: true
+    })),
+    ...props.friends
+      .filter((friend: any) => !friend.conversationId)
+      .map((friend: any) => ({
+        key: `friend:${friend.id}`,
+        id: friend.conversationId,
+        name: friend.displayName,
+        secondary: friend.email,
+        unreadCount: 0,
+        selectable: false
+      }))
+  ];
+
   return (
     <Stack className="sidebar-content" spacing={2.5}>
       <Box>
-        <Typography variant="h6">Chats</Typography>
+        <Typography variant="h6">Contacts</Typography>
         <List disablePadding>
-          {props.conversations.map((conversation) => (
+          {contacts.map((contact) => (
             <ListItemButton
-              key={conversation.id}
-              selected={props.activeConversationId === conversation.id}
-              onClick={() => props.onSelectConversation(conversation.id)}
+              key={contact.key}
+              selected={props.activeConversationId === contact.id}
+              disabled={!contact.selectable}
+              onClick={() => contact.id && props.onSelectConversation(contact.id)}
             >
               <ListItemText
                 primary={
                   <Stack direction="row" alignItems="center" justifyContent="space-between">
-                    <Typography variant="body2">
-                      {conversation.counterpart?.displayName ?? "Direct conversation"}
-                    </Typography>
-                    {props.conversationMeta[conversation.id]?.unreadCount > 0 && (
-                      <Badge
-                        color="primary"
-                        badgeContent={props.conversationMeta[conversation.id]?.unreadCount}
-                      />
+                    <Typography variant="body2">{contact.name}</Typography>
+                    {contact.unreadCount > 0 && (
+                      <Badge color="primary" badgeContent={contact.unreadCount} />
                     )}
                   </Stack>
                 }
-                secondary={
-                  props.conversationMeta[conversation.id]?.preview ||
-                  conversation.counterpart?.email ||
-                  "Encrypted channel"
-                }
+                secondary={contact.secondary}
               />
             </ListItemButton>
           ))}
@@ -650,17 +703,6 @@ function SidebarContent(props: {
           {!props.requests.some((request: any) => request.direction === "incoming" && request.status === "pending") && (
             <Typography color="text.secondary">No requests</Typography>
           )}
-        </Stack>
-      </Box>
-      <Divider />
-      <Box>
-        <Typography variant="h6">Friends</Typography>
-        <Stack spacing={1} mt={1.5}>
-          {props.friends.map((friend: any) => (
-            <Paper key={friend.id} variant="outlined" sx={{ p: 1.5 }}>
-              <Typography>{friend.displayName}</Typography>
-            </Paper>
-          ))}
         </Stack>
       </Box>
     </Stack>
