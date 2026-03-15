@@ -27,6 +27,16 @@ export interface SessionResponse {
   user: SessionUser | null;
 }
 
+export interface AuthSession {
+  token: string;
+  user: SessionUser;
+}
+
+export interface AuthResponse {
+  ok: boolean;
+  session: AuthSession;
+}
+
 export interface LocalAuthInput {
   email: string;
   password: string;
@@ -127,6 +137,19 @@ export interface ConversationDetail {
 
 export interface SendMessageInput {
   envelope: CiphertextEnvelope;
+}
+
+export interface SendMessageResponse {
+  ok: boolean;
+  messageId: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface ConversationMessagesSyncResponse {
+  conversationId: string;
+  latestMessageAt: string | null;
+  messages: MessageRecord[];
 }
 
 export const isoNow = (): string => new Date().toISOString();

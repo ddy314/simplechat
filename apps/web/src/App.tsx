@@ -55,6 +55,7 @@ import {
   type DecryptedMessage,
   type DeviceIdentity
 } from "./lib/crypto";
+import { saveStoredSessionToken } from "./lib/storage";
 
 type SessionState =
   | { loading: true }
@@ -69,7 +70,7 @@ type ConversationMeta = {
   lastMessageAt: string | null;
 };
 
-type MessageClientStatus = "sending" | "sent-local" | "failed";
+type MessageClientStatus = "sending" | "failed";
 
 type ChatMessage = DecryptedMessage & {
   clientStatus?: MessageClientStatus;
@@ -101,7 +102,8 @@ const SEEN_STORAGE_KEY = "simplechat_seen_map";
 const INITIAL_VISIBLE_MESSAGES = 80;
 const MESSAGE_PAGE_SIZE = 80;
 const AUTO_SCROLL_THRESHOLD = 96;
-const BACKGROUND_SYNC_INTERVAL_MS = 3_000;
+const BACKGROUND_SYNC_INTERVAL_MS = 1_200;
+const REFRESH_THROTTLE_MS = 700;
 const MUTATION_CONFIRM_TIMEOUT_MS = 8_000;
 
 export default function App() {
@@ -124,7 +126,6 @@ export default function App() {
   const [selectedTtl, setSelectedTtl] = useState(TTL_PRESETS[1].value);
   const [burnAfterRead, setBurnAfterRead] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [authEmail, setAuthEmail] = useState("");
@@ -154,6 +155,7 @@ export default function App() {
   const conversationCacheRef = useLatestRef(conversationCache);
   const currentUserRef = useLatestRef(currentUser);
   const deviceRef = useLatestRef(device);
+  const conversationDetailRef = useLatestRef(conversationDetail);
   const messagesRef = useLatestRef(messages);
   const requestsRef = useLatestRef(requests);
   const conversationsRef = useLatestRef(conversations);
@@ -326,7 +328,7 @@ export default function App() {
     }
 
     const now = Date.now();
-    if (!options.forceConversation && now - lastRefreshAtRef.current < 1_200) {
+    if (!options.forceConversation && now - lastRefreshAtRef.current < REFRESH_THROTTLE_MS) {
       return;
     }
 
@@ -448,6 +450,18 @@ export default function App() {
     ]);
   }
 
+  function mergeIncrementalMessages(
+    remoteMessages: DecryptedMessage[],
+    existingMessages: ChatMessage[]
+  ): ChatMessage[] {
+    const merged = new Map(existingMessages.map((message) => [message.id, message]));
+    for (const message of remoteMessages) {
+      merged.set(message.id, { ...message, clientStatus: undefined });
+    }
+
+    return sortMessages(Array.from(merged.values()));
+  }
+
   function setConversationState(
     conversationId: string,
     detail: ConversationDetail,
@@ -560,13 +574,15 @@ export default function App() {
       ]);
 
       setProviders(providersResponse.providers);
-      setSession(
-        sessionResponse.authenticated && sessionResponse.user
-          ? { loading: false, user: sessionResponse.user }
-          : { loading: false, user: null }
-      );
+      if (sessionResponse.authenticated && sessionResponse.user) {
+        setSession({ loading: false, user: sessionResponse.user });
+      } else {
+        saveStoredSessionToken(null);
+        setSession({ loading: false, user: null });
+      }
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Failed to initialize app.");
+      saveStoredSessionToken(null);
       setSession({ loading: false, user: null });
     }
   }
@@ -619,6 +635,90 @@ export default function App() {
         lastMessageAt:
           visible.at(-1)?.createdAt ??
           detail.conversation.lastMessageAt ??
+          previous[input.conversationId]?.lastMessageAt ??
+          null
+      }
+    }));
+
+    if (input.markSeen) {
+      markConversationSeen(input.conversationId, visible);
+    }
+
+    for (const message of visible) {
+      if (
+        message.burnAfterRead &&
+        message.senderUserId !== input.userId &&
+        !readMarksRef.current.has(message.id)
+      ) {
+        readMarksRef.current.add(message.id);
+        void api.markMessageRead(input.conversationId, message.id);
+      }
+    }
+
+    setLoadingConversationId((current) =>
+      current === input.conversationId ? null : current
+    );
+  }
+
+  async function syncConversationMessages(input: {
+    conversationId: string;
+    identity: DeviceIdentity;
+    userId: string;
+    requestId: number;
+    markSeen: boolean;
+    after: string;
+  }) {
+    const cachedDetail =
+      conversationCacheRef.current[input.conversationId]?.detail ??
+      (activeConversationIdRef.current === input.conversationId
+        ? conversationDetailRef.current
+        : null);
+    if (!cachedDetail) {
+      await refreshConversationDetail(input);
+      return;
+    }
+
+    const response = await api.getConversationMessages(input.conversationId, input.after);
+    if (input.requestId !== syncRequestRef.current) {
+      return;
+    }
+
+    const decrypted = await Promise.all(
+      response.messages.map((message) => decryptMessage(input.identity, message))
+    );
+    if (input.requestId !== syncRequestRef.current) {
+      return;
+    }
+
+    const remoteMessages = decrypted.filter(
+      (message): message is DecryptedMessage => message !== null
+    );
+    const existingMessages =
+      conversationCacheRef.current[input.conversationId]?.messages ??
+      (activeConversationIdRef.current === input.conversationId ? messagesRef.current : []);
+    const visible = mergeIncrementalMessages(remoteMessages, existingMessages);
+    const unreadCount = input.markSeen
+      ? 0
+      : countUnreadMessages(
+          visible,
+          input.userId,
+          seenMapRef.current[input.conversationId]
+        );
+
+    setConversationState(input.conversationId, cachedDetail, visible);
+    setConversationMeta((previous) => ({
+      ...previous,
+      [input.conversationId]: {
+        preview:
+          visible.at(-1)?.markdown
+            ? toPreview(visible.at(-1)!.markdown)
+            : previous[input.conversationId]?.preview ??
+              cachedDetail.conversation.counterpart?.email ??
+              "Encrypted channel",
+        unreadCount,
+        lastMessageAt:
+          visible.at(-1)?.createdAt ??
+          response.latestMessageAt ??
           previous[input.conversationId]?.lastMessageAt ??
           null
       }
@@ -703,13 +803,37 @@ export default function App() {
       const targetConversation =
         snapshot.conversations.find((conversation) => conversation.id === nextActiveConversationId) ??
         null;
-      if (
-        !shouldRefreshConversationDetail(
-          targetConversation,
-          conversationCacheRef.current[nextActiveConversationId],
-          options.forceConversation ?? false
-        )
-      ) {
+      const cachedConversation = conversationCacheRef.current[nextActiveConversationId];
+      const syncMode = getConversationSyncMode(
+        targetConversation,
+        cachedConversation,
+        options.forceConversation ?? false
+      );
+      if (syncMode === "none") {
+        return;
+      }
+
+      if (syncMode === "incremental") {
+        const after = cachedConversation?.messages.at(-1)?.createdAt;
+        if (!after) {
+          await refreshConversationDetail({
+            conversationId: nextActiveConversationId,
+            identity: identityOverride,
+            userId: user.id,
+            requestId,
+            markSeen: nextActiveConversationId === activeConversationIdRef.current
+          });
+          return;
+        }
+
+        await syncConversationMessages({
+          conversationId: nextActiveConversationId,
+          identity: identityOverride,
+          userId: user.id,
+          requestId,
+          markSeen: nextActiveConversationId === activeConversationIdRef.current,
+          after
+        });
         return;
       }
 
@@ -818,7 +942,6 @@ export default function App() {
 
     setComposer("");
     shouldStickToBottomRef.current = true;
-    setIsSendingMessage(true);
 
     const currentDetail =
       conversationCacheRef.current[conversationId]?.detail ?? conversationDetail;
@@ -859,34 +982,28 @@ export default function App() {
         createdAt
       });
 
-      await api.sendMessage(conversationId, envelope);
+      const response = await api.sendMessage(conversationId, envelope);
       patchConversationMessages(conversationId, (previous) =>
         previous.map((message) =>
           message.id === messageId
             ? {
                 ...message,
                 envelope,
-                expiresAt: envelope.expiresAt,
-                clientStatus: "sent-local"
+                createdAt: response.createdAt,
+                expiresAt: response.expiresAt,
+                clientStatus: undefined
               }
             : message
         )
       );
-
-      void waitForServerState({
-        syncOptions: {
-          targetConversationId: conversationId,
-          forceConversation: true
-        },
-        settled: () => {
-          const cachedConversation = conversationCacheRef.current[conversationId];
-          return (
-            cachedConversation?.messages.some(
-              (message) => message.id === messageId && !message.clientStatus
-            ) ?? false
-          );
+      setConversationMeta((previous) => ({
+        ...previous,
+        [conversationId]: {
+          preview: toPreview(markdown),
+          unreadCount: 0,
+          lastMessageAt: response.createdAt
         }
-      });
+      }));
     } catch (error) {
       patchConversationMessages(conversationId, (previous) =>
         previous.map((message) =>
@@ -894,8 +1011,6 @@ export default function App() {
         )
       );
       setNotice(error instanceof Error ? error.message : "Failed to send message.");
-    } finally {
-      setIsSendingMessage(false);
     }
   }
 
@@ -905,9 +1020,7 @@ export default function App() {
     }
 
     event.preventDefault();
-    if (!isSendingMessage) {
-      void handleSendMessage();
-    }
+    void handleSendMessage();
   }
 
   async function handleAddFriend() {
@@ -969,6 +1082,7 @@ export default function App() {
 
     try {
       await api.logout();
+      saveStoredSessionToken(null);
       window.localStorage.removeItem(SEEN_STORAGE_KEY);
       resetWorkspaceState(true);
       setSession({ loading: false, user: null });
@@ -1033,21 +1147,26 @@ export default function App() {
     setBusy(true);
 
     try {
-      if (authMode === "register") {
-        await api.register({
-          email: authEmail,
-          password: authPassword,
-          displayName: authDisplayName
-        });
-      } else {
-        await api.login({
-          email: authEmail,
-          password: authPassword
-        });
-      }
+      const response =
+        authMode === "register"
+          ? await api.register({
+              email: authEmail,
+              password: authPassword,
+              displayName: authDisplayName
+            })
+          : await api.login({
+              email: authEmail,
+              password: authPassword
+            });
 
+      saveStoredSessionToken(response.session.token);
+      setNotice(null);
+      if (authMode === "register") {
+        setAuthDisplayName("");
+      }
+      setAuthEmail("");
       setAuthPassword("");
-      await bootstrap();
+      setSession({ loading: false, user: response.session.user });
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Authentication failed.");
     } finally {
@@ -1217,9 +1336,6 @@ export default function App() {
                               {message.clientStatus === "sending" && (
                                 <Chip size="small" label="Sending..." variant="outlined" />
                               )}
-                              {message.clientStatus === "sent-local" && (
-                                <Chip size="small" label="Syncing..." variant="outlined" />
-                              )}
                               {message.clientStatus === "failed" && (
                                 <Chip
                                   size="small"
@@ -1287,14 +1403,8 @@ export default function App() {
                         <Button
                           variant="contained"
                           className="send-button"
-                          endIcon={
-                            isSendingMessage ? (
-                              <CircularProgress size={16} color="inherit" />
-                            ) : (
-                              <SendRoundedIcon />
-                            )
-                          }
-                          disabled={isSendingMessage || !activeConversationId || !composer.trim()}
+                          endIcon={<SendRoundedIcon />}
+                          disabled={!activeConversationId || !composer.trim()}
                           onClick={handleSendMessage}
                         >
                           Send
@@ -1879,23 +1989,25 @@ function resolveNextActiveConversationId(
   return isMobile ? null : conversations[0]?.id ?? null;
 }
 
-function shouldRefreshConversationDetail(
+function getConversationSyncMode(
   conversation: ConversationSummary | null,
   cachedConversation: ConversationCacheEntry | undefined,
   force: boolean
 ) {
   if (!conversation) {
-    return false;
+    return "none";
   }
 
   if (force || !cachedConversation) {
-    return true;
+    return "full";
   }
 
-  const hasPendingMessages = cachedConversation.messages.some((message) => message.clientStatus);
   const latestCachedMessageAt = cachedConversation.messages.at(-1)?.createdAt ?? null;
+  if (!latestCachedMessageAt) {
+    return "full";
+  }
 
-  return hasPendingMessages || conversation.lastMessageAt !== latestCachedMessageAt;
+  return conversation.lastMessageAt !== latestCachedMessageAt ? "incremental" : "none";
 }
 
 function countUnreadMessages(

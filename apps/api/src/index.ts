@@ -2,8 +2,10 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import {
+  type AuthResponse,
   clampTtl,
   type CiphertextEnvelope,
+  type ConversationMessagesSyncResponse,
   type ConversationDetail,
   type ConversationSummary,
   type DeviceRecord,
@@ -12,6 +14,8 @@ import {
   type LocalAuthInput,
   type OAuthProviderConfig,
   type SessionResponse,
+  type SessionUser,
+  type SendMessageResponse,
   type WorkspaceSnapshot
 } from "@simplechat/protocol";
 
@@ -90,7 +94,8 @@ app.use(
 );
 
 app.use("*", async (c, next) => {
-  const token = getCookie(c, SESSION_COOKIE);
+  const token =
+    getCookie(c, SESSION_COOKIE) ?? getBearerToken(c.req.header("Authorization"));
   if (!token) {
     c.set("session", null);
     return next();
@@ -227,8 +232,18 @@ app.post("/auth/register", async (c) => {
     throw error;
   }
 
-  await createSession(c, userId);
-  return c.json({ ok: true }, 201);
+  const sessionToken = await createSession(c, userId);
+  const user = await loadSessionUser(c.env.DB, userId);
+  return c.json(
+    {
+      ok: true,
+      session: {
+        token: sessionToken,
+        user
+      }
+    } satisfies AuthResponse,
+    201
+  );
 });
 
 app.post("/auth/login", async (c) => {
@@ -268,8 +283,15 @@ app.post("/auth/login", async (c) => {
     return c.json({ error: "Invalid email or password." }, 401);
   }
 
-  await createSession(c, credential.user_id);
-  return c.json({ ok: true });
+  const sessionToken = await createSession(c, credential.user_id);
+  const user = await loadSessionUser(c.env.DB, credential.user_id);
+  return c.json({
+    ok: true,
+    session: {
+      token: sessionToken,
+      user
+    }
+  } satisfies AuthResponse);
 });
 
 app.get("/auth/oauth/:provider/start", async (c) => {
@@ -545,14 +567,52 @@ app.get("/api/conversations/:conversationId", requireSession, async (c) => {
     return c.json({ error: "Conversation not found." }, 404);
   }
 
-  await incrementUsageCounter(c.env.DB, "r2_reads_day", 1, MAX_R2_READS_PER_DAY);
   const detail = await loadConversationDetail(
     c.env.DB,
     c.env.MESSAGE_BLOB,
     conversationId,
     session.userId
   );
+  if (detail.messages.length > 0) {
+    await incrementUsageCounter(
+      c.env.DB,
+      "r2_reads_day",
+      detail.messages.length,
+      MAX_R2_READS_PER_DAY
+    );
+  }
   return c.json(detail satisfies ConversationDetail);
+});
+
+app.get("/api/conversations/:conversationId/messages", requireSession, async (c) => {
+  const session = c.get("session")!;
+  const conversationId = c.req.param("conversationId");
+  const after = c.req.query("after")?.trim() || null;
+  const member = await c.env.DB.prepare(
+    "SELECT 1 FROM conversation_members WHERE conversation_id = ?1 AND user_id = ?2"
+  )
+    .bind(conversationId, session.userId)
+    .first();
+
+  if (!member) {
+    return c.json({ error: "Conversation not found." }, 404);
+  }
+
+  const messages = await loadConversationMessages(
+    c.env.DB,
+    c.env.MESSAGE_BLOB,
+    conversationId,
+    after
+  );
+  if (messages.length > 0) {
+    await incrementUsageCounter(c.env.DB, "r2_reads_day", messages.length, MAX_R2_READS_PER_DAY);
+  }
+
+  return c.json({
+    conversationId,
+    latestMessageAt: messages.at(-1)?.createdAt ?? after,
+    messages
+  } satisfies ConversationMessagesSyncResponse);
 });
 
 app.post("/api/conversations/:conversationId/messages", requireSession, async (c) => {
@@ -640,7 +700,15 @@ app.post("/api/conversations/:conversationId/messages", requireSession, async (c
     )
     .run();
 
-  return c.json({ ok: true, messageId: normalizedEnvelope.messageId }, 201);
+  return c.json(
+    {
+      ok: true,
+      messageId: normalizedEnvelope.messageId,
+      createdAt: normalizedEnvelope.createdAt,
+      expiresAt: normalizedEnvelope.expiresAt
+    } satisfies SendMessageResponse,
+    201
+  );
 });
 
 app.post("/api/conversations/:conversationId/messages/:messageId/read", requireSession, async (c) => {
@@ -874,8 +942,50 @@ async function loadConversationDetail(
       public_key: string;
     }>();
 
-  const messageRows = await db.prepare(
+  const messages = await loadConversationMessages(db, bucket, conversationId, null);
+
+  return {
+    conversation,
+    participants: participantsResult.results.map((row) => ({
+      id: row.id,
+      email: row.email,
+      displayName: row.display_name,
+      avatarUrl: row.avatar_url
+    })),
+    participantDevices: devicesResult.results.map((row) => ({
+      userId: row.user_id,
+      deviceId: row.device_id,
+      label: row.label,
+      publicKey: row.public_key
+    })),
+    messages
+  };
+}
+
+async function loadConversationMessages(
+  db: D1Database,
+  bucket: R2Bucket,
+  conversationId: string,
+  after: string | null
+): Promise<ConversationDetail["messages"]> {
+  const query = after
+    ? `
+      SELECT
+        messages.id,
+        messages.sender_user_id,
+        users.display_name AS sender_display_name,
+        users.avatar_url AS sender_avatar_url,
+        messages.created_at,
+        messages.expires_at,
+        messages.burn_after_read,
+        messages.r2_key
+      FROM messages
+      JOIN users ON users.id = messages.sender_user_id
+      WHERE messages.conversation_id = ?1 AND messages.created_at > ?2
+      ORDER BY messages.created_at ASC
+      LIMIT 100
     `
+    : `
       SELECT
         messages.id,
         messages.sender_user_id,
@@ -890,12 +1000,14 @@ async function loadConversationDetail(
       WHERE messages.conversation_id = ?1
       ORDER BY messages.created_at ASC
       LIMIT 100
-    `
-  )
-    .bind(conversationId)
-    .all<MessageIndexRow>();
+    `;
 
-  const messages = (
+  const statement = db.prepare(query);
+  const messageRows = after
+    ? await statement.bind(conversationId, after).all<MessageIndexRow>()
+    : await statement.bind(conversationId).all<MessageIndexRow>();
+
+  return (
     await Promise.all(
       messageRows.results.map(async (row) => {
         const object = await bucket.get(row.r2_key);
@@ -917,23 +1029,6 @@ async function loadConversationDetail(
       })
     )
   ).filter((message): message is ConversationDetail["messages"][number] => message !== null);
-
-  return {
-    conversation,
-    participants: participantsResult.results.map((row) => ({
-      id: row.id,
-      email: row.email,
-      displayName: row.display_name,
-      avatarUrl: row.avatar_url
-    })),
-    participantDevices: devicesResult.results.map((row) => ({
-      userId: row.user_id,
-      deviceId: row.device_id,
-      label: row.label,
-      publicKey: row.public_key
-    })),
-    messages
-  };
 }
 
 async function assertR2QuotaAvailable(
@@ -1269,7 +1364,31 @@ function validateEnvelope(envelope: CiphertextEnvelope): boolean {
   );
 }
 
-async function createSession(c: any, userId: string): Promise<void> {
+async function loadSessionUser(db: D1Database, userId: string): Promise<SessionUser> {
+  const user = await db.prepare(
+    "SELECT id, email, display_name, avatar_url FROM users WHERE id = ?1"
+  )
+    .bind(userId)
+    .first<{
+      id: string;
+      email: string;
+      display_name: string;
+      avatar_url: string | null;
+    }>();
+
+  if (!user) {
+    throw new Error("User not found.");
+  }
+
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.display_name,
+    avatarUrl: user.avatar_url
+  };
+}
+
+async function createSession(c: any, userId: string): Promise<string> {
   const sessionToken = randomToken();
   const sessionTokenHash = await sha256Hex(sessionToken + c.env.SESSION_SECRET);
   const now = new Date();
@@ -1292,6 +1411,8 @@ async function createSession(c: any, userId: string): Promise<void> {
     path: "/",
     maxAge: SESSION_TTL_SECONDS
   });
+
+  return sessionToken;
 }
 
 async function sha256Hex(value: string): Promise<string> {
@@ -1331,6 +1452,19 @@ function randomToken(): string {
 
 function normalizeEmail(value?: string): string {
   return value?.trim().toLowerCase() ?? "";
+}
+
+function getBearerToken(headerValue?: string | null): string | null {
+  if (!headerValue) {
+    return null;
+  }
+
+  const [scheme, token] = headerValue.split(/\s+/, 2);
+  if (scheme?.toLowerCase() !== "bearer" || !token) {
+    return null;
+  }
+
+  return token;
 }
 
 function toBase64Url(bytes: Uint8Array): string {

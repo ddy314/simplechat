@@ -1,4 +1,6 @@
 import type {
+  AuthResponse,
+  ConversationMessagesSyncResponse,
   ConversationDetail,
   ConversationSummary,
   DeviceRecord,
@@ -7,8 +9,10 @@ import type {
   LocalAuthInput,
   OAuthProviderConfig,
   SessionResponse,
+  SendMessageResponse,
   WorkspaceSnapshot
 } from "@simplechat/protocol";
+import { loadStoredSessionToken, saveStoredSessionToken } from "./storage";
 
 const jsonHeaders = {
   "Content-Type": "application/json"
@@ -18,14 +22,20 @@ export class ApiClient {
   constructor(private readonly baseUrl: string) {}
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const token = loadStoredSessionToken();
     const response = await fetch(`${this.baseUrl}${path}`, {
       credentials: "include",
       ...init,
       headers: {
         ...jsonHeaders,
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(init?.headers ?? {})
       }
     });
+
+    if (response.status === 401) {
+      saveStoredSessionToken(null);
+    }
 
     if (!response.ok) {
       const payload = (await response.json().catch(() => null)) as { error?: string } | null;
@@ -43,14 +53,14 @@ export class ApiClient {
     return this.request("/auth/session", { method: "GET" });
   }
 
-  register(input: LocalAuthInput): Promise<{ ok: boolean }> {
+  register(input: LocalAuthInput): Promise<AuthResponse> {
     return this.request("/auth/register", {
       method: "POST",
       body: JSON.stringify(input)
     });
   }
 
-  login(input: LocalAuthInput): Promise<{ ok: boolean }> {
+  login(input: LocalAuthInput): Promise<AuthResponse> {
     return this.request("/auth/login", {
       method: "POST",
       body: JSON.stringify(input)
@@ -109,7 +119,17 @@ export class ApiClient {
     return this.request(`/api/conversations/${conversationId}`, { method: "GET" });
   }
 
-  sendMessage(conversationId: string, envelope: unknown): Promise<{ ok: boolean }> {
+  getConversationMessages(
+    conversationId: string,
+    after?: string | null
+  ): Promise<ConversationMessagesSyncResponse> {
+    const search = after ? `?after=${encodeURIComponent(after)}` : "";
+    return this.request(`/api/conversations/${conversationId}/messages${search}`, {
+      method: "GET"
+    });
+  }
+
+  sendMessage(conversationId: string, envelope: unknown): Promise<SendMessageResponse> {
     return this.request(`/api/conversations/${conversationId}/messages`, {
       method: "POST",
       body: JSON.stringify({ envelope })
